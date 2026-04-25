@@ -98,6 +98,56 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second_messages[-1]["tool_call_id"], "call_1")
         self.assertIn("get_files_info result", second_messages[-1]["content"])
 
+    async def test_coerces_plain_json_tool_request_from_model_content(self):
+        model = FakeModelClient(
+            [
+                ModelResponse(
+                    '{"name": "get_files_info", "arguments": {"directory": "."}}'
+                ),
+                ModelResponse("files checked"),
+            ]
+        )
+        tools = FakeToolClient()
+
+        result = await run_agent(
+            "list files",
+            settings=_settings(),
+            model_client=model,
+            tool_client=tools,
+        )
+
+        self.assertEqual(result.content, "files checked")
+        self.assertEqual(tools.calls, [("get_files_info", {"directory": "."})])
+        second_messages = model.calls[1]["messages"]
+        self.assertEqual(second_messages[-2]["role"], "assistant")
+        self.assertIsNone(second_messages[-2]["content"])
+        self.assertEqual(
+            second_messages[-2]["tool_calls"][0]["function"]["name"],
+            "get_files_info",
+        )
+        self.assertEqual(second_messages[-1]["tool_call_id"], "call_text_0")
+
+    async def test_coerces_tool_request_with_unquoted_name_value(self):
+        model = FakeModelClient(
+            [
+                ModelResponse(
+                    '{"name": get_files_info, "arguments": {"directory": "."}}'
+                ),
+                ModelResponse("files checked"),
+            ]
+        )
+        tools = FakeToolClient()
+
+        result = await run_agent(
+            "list files",
+            settings=_settings(),
+            model_client=model,
+            tool_client=tools,
+        )
+
+        self.assertEqual(result.content, "files checked")
+        self.assertEqual(tools.calls, [("get_files_info", {"directory": "."})])
+
     async def test_calls_multiple_tools_from_one_assistant_turn(self):
         model = FakeModelClient(
             [

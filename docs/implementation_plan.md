@@ -62,6 +62,7 @@ Status: complete in `docker-compose.yml`, `models/`, `Makefile`, and `scripts/mo
 - Add an OpenAI-compatible chat completions client for Ollama without requiring model calls in unit tests.
 - Add an MCP client adapter that can list tools, read the coding-agent system prompt, and call MCP tools over Streamable HTTP.
 - Add an agent loop that converts MCP tool schemas to OpenAI tool definitions, handles model tool calls, sends tool results back to the model, and stops on final assistant content.
+- Handle Qwen/Ollama's local text-form tool requests when it returns a JSON-like `{name, arguments}` payload instead of native OpenAI `tool_calls`.
 - Cover the loop with mocked model and MCP clients, including direct answers, tool use, multiple tool calls, malformed tool arguments, and max-iteration failure.
 - Keep the old direct Gemini CLI path intact until the later cleanup slice.
 
@@ -69,6 +70,15 @@ Status: complete in `coding_agent/model_client.py`, `coding_agent/mcp_client.py`
 
 ```bash
 .venv/bin/python -m coding_agent.agent "your prompt here"
+```
+
+Local smoke validation passed with `coding-qwen-gpu` loaded `100% GPU`:
+
+```bash
+make model-check
+.venv/bin/python -m coding_agent.mcp_server
+.venv/bin/python -m coding_agent.agent --verbose "Use the available tool to list files in . and summarize what this project is."
+.venv/bin/python -m coding_agent.agent --verbose "Use the available tool to read README.md. After reading it, answer with only the first Markdown heading from that file."
 ```
 
 ## Test Strategy

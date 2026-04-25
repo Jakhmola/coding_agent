@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -57,13 +58,22 @@ async def run_agent(
         mcp_tool_to_openai_tool(tool)
         for tool in await tool_client.list_tools()
     ]
+    tool_names = {
+        tool["function"]["name"]
+        for tool in tools
+        if isinstance(tool.get("function"), dict)
+        and isinstance(tool["function"].get("name"), str)
+    }
     messages: list[JsonObject] = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
 
     for iteration in range(1, settings.max_iterations + 1):
-        response = await model_client.complete(messages, tools)
+        response = _coerce_text_tool_call(
+            await model_client.complete(messages, tools),
+            tool_names,
+        )
         assistant_message = _assistant_message(response)
         messages.append(assistant_message)
 
@@ -126,6 +136,72 @@ def _assistant_message(response: ModelResponse) -> JsonObject:
             for tool_call in response.tool_calls
         ]
     return message
+
+
+def _coerce_text_tool_call(
+    response: ModelResponse,
+    tool_names: set[str],
+) -> ModelResponse:
+    if response.tool_calls or response.content is None:
+        return response
+
+    content = response.content.strip()
+    if content.startswith("```"):
+        content = _strip_code_fence(content)
+
+    payload = _parse_text_tool_payload(content)
+    if payload is None:
+        return response
+
+    name = payload.get("name")
+    arguments = payload.get("arguments", {})
+    if not isinstance(name, str) or name not in tool_names:
+        return response
+
+    if isinstance(arguments, str):
+        arguments_json = arguments
+    else:
+        arguments_json = json.dumps(arguments)
+
+    return ModelResponse(
+        content=None,
+        tool_calls=(
+            ModelToolCall(
+                id="call_text_0",
+                name=name,
+                arguments=arguments_json,
+            ),
+        ),
+    )
+
+
+def _parse_text_tool_payload(content: str) -> JsonObject | None:
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError:
+        fixed_content = re.sub(
+            r'("name"\s*:\s*)([A-Za-z_][A-Za-z0-9_.-]*)',
+            r'\1"\2"',
+            content,
+            count=1,
+        )
+        if fixed_content == content:
+            return None
+        try:
+            payload = json.loads(fixed_content)
+        except json.JSONDecodeError:
+            return None
+
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def _strip_code_fence(content: str) -> str:
+    lines = content.splitlines()
+    if len(lines) >= 2 and lines[0].startswith("```") and lines[-1].strip() == "```":
+        return "\n".join(lines[1:-1]).strip()
+    return content
 
 
 async def _call_tool(tool_client: ToolClient, tool_call: ModelToolCall) -> str:

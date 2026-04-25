@@ -26,7 +26,7 @@ Default model: `qwen2.5-coder:7b-instruct-q4_0`, wrapped as `coding-qwen-gpu`.
 - [x] Slice 1: Config, constants, structured logging foundation, workspace policy config, `.env.example`.
 - [x] Slice 2: Harden current tools with workspace policy and focused tests.
 - [x] Slice 3: MCP server exposing current tools and system prompt.
-- [ ] Slice 4: Ollama Docker service, Modelfile, model pull/check workflow.
+- [x] Slice 4: Ollama Docker service, Modelfile, model pull/check workflow.
 - [ ] Slice 5: OpenAI-compatible MCP-backed agent loop with mocked model tests.
 - [ ] Slice 6: A2A HTTP wrapper and CLI commands.
 - [ ] Slice 7: Opik tracing hooks with clean disabled mode.
@@ -46,6 +46,16 @@ Status: complete in `coding_agent/mcp_server.py`. Smoke command:
 ```bash
 .venv/bin/python -m coding_agent.mcp_server --list
 ```
+
+## Slice 4 Acceptance Criteria
+
+- Add an Ollama Docker Compose service with NVIDIA GPU access and persistent model storage.
+- Add Modelfiles for `coding-qwen-gpu` using `qwen2.5-coder:7b-instruct-q4_0` at `num_ctx 4096`, plus one reduced-context `2048` fallback.
+- Add Make targets for starting Ollama, pulling/creating the model, validating Compose config, and checking the model is loaded `100% GPU`.
+- Enforce the strict fallback rule: if default context is not `100% GPU`, recreate once with reduced context; if still not `100% GPU`, fail loudly.
+- Do not pull the model automatically during normal tests.
+
+Status: complete in `docker-compose.yml`, `models/`, `Makefile`, and `scripts/model_check.py`.
 
 ## Test Strategy
 

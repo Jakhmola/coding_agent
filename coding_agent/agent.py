@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -217,43 +218,191 @@ async def _call_tool(tool_client: ToolClient, tool_call: ModelToolCall) -> str:
     return await tool_client.call_tool(tool_call.name, arguments)
 
 
-def format_tool_trace(messages: tuple[JsonObject, ...]) -> list[str]:
+def format_agent_trace(messages: tuple[JsonObject, ...]) -> list[str]:
     lines: list[str] = []
-    tool_results = {
-        message.get("tool_call_id"): message
-        for message in messages
-        if message.get("role") == "tool"
-    }
+    user_message = _first_message_with_role(messages, "user")
+    model_turns = sum(1 for message in messages if message.get("role") == "assistant")
+    tool_calls = _count_tool_calls(messages)
 
-    for message in messages:
-        tool_calls = message.get("tool_calls")
-        if not isinstance(tool_calls, list):
+    lines.append("Agent trace")
+    if user_message is not None:
+        lines.append(
+            f"User input: {_single_line(str(user_message.get('content', '')), limit=500)}"
+        )
+    lines.append(f"Model turns: {model_turns}")
+    lines.append(f"Tool calls: {tool_calls}")
+
+    for index, message in enumerate(messages):
+        if message.get("role") != "assistant":
             continue
 
-        for tool_call in tool_calls:
-            if not isinstance(tool_call, dict):
-                continue
-            function = tool_call.get("function")
-            if not isinstance(function, dict):
-                continue
+        turn_number = sum(
+            1
+            for prior_message in messages[: index + 1]
+            if prior_message.get("role") == "assistant"
+        )
+        lines.append("")
+        lines.append(f"Model turn {turn_number}")
+        lines.append("  Sent to model:")
+        sent_summaries = _summarize_model_input(tuple(messages[:index]))
+        if sent_summaries:
+            lines.extend(f"    - {summary}" for summary in sent_summaries)
+        else:
+            lines.append("    - no prior messages")
 
-            call_id = tool_call.get("id")
-            name = function.get("name")
-            arguments = function.get("arguments", "{}")
-            if not isinstance(name, str):
-                continue
-            if not isinstance(arguments, str):
-                arguments = json.dumps(arguments, sort_keys=True)
+        lines.append("  Model response:")
+        lines.extend(
+            f"    - {summary}" for summary in _summarize_assistant_response(message)
+        )
 
-            pretty_args = _format_jsonish(arguments)
-            lines.append(f"- {name}({pretty_args})")
-
-            result = tool_results.get(call_id)
-            if result is not None:
-                preview = _single_line(str(result.get("content", "")), limit=240)
-                lines.append(f"  result: {preview}")
+        tool_call_lines = _summarize_tool_calls_after_response(
+            message,
+            tuple(messages[index + 1 :]),
+        )
+        if tool_call_lines:
+            lines.append("  Tool execution:")
+            lines.extend(f"    - {summary}" for summary in tool_call_lines)
+            lines.append("  Sent back to model next turn:")
+            lines.extend(
+                f"    - {summary}"
+                for summary in _summarize_tool_results_after_response(
+                    message,
+                    tuple(messages[index + 1 :]),
+                )
+            )
 
     return lines
+
+
+def _first_message_with_role(
+    messages: tuple[JsonObject, ...],
+    role: str,
+) -> JsonObject | None:
+    for message in messages:
+        if message.get("role") == role:
+            return message
+    return None
+
+
+def _count_tool_calls(messages: tuple[JsonObject, ...]) -> int:
+    count = 0
+    for message in messages:
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list):
+            count += len(tool_calls)
+    return count
+
+
+def _summarize_model_input(messages: tuple[JsonObject, ...]) -> list[str]:
+    summaries: list[str] = []
+    for message in messages:
+        role = message.get("role")
+        if role == "system":
+            summaries.append("system prompt")
+        elif role == "user":
+            summaries.append(
+                f"user: {_single_line(str(message.get('content', '')), limit=240)}"
+            )
+        elif role == "assistant":
+            summaries.extend(_summarize_assistant_response(message, prefix="assistant"))
+        elif role == "tool":
+            name = message.get("name") or message.get("tool_call_id") or "tool"
+            content = _single_line(str(message.get("content", "")), limit=240)
+            summaries.append(f"tool result from {name}: {content}")
+    return summaries
+
+
+def _summarize_assistant_response(
+    message: JsonObject,
+    *,
+    prefix: str = "assistant",
+) -> list[str]:
+    summaries: list[str] = []
+    content = message.get("content")
+    if isinstance(content, str) and content.strip():
+        summaries.append(f"{prefix}: {_single_line(content, limit=500)}")
+
+    tool_calls = message.get("tool_calls")
+    if isinstance(tool_calls, list):
+        for tool_call in tool_calls:
+            name, arguments = _tool_call_name_and_arguments(tool_call)
+            if name is not None:
+                summaries.append(f"{prefix} requested tool: {name}({arguments})")
+
+    if not summaries:
+        summaries.append(f"{prefix}: <empty response>")
+    return summaries
+
+
+def _summarize_tool_calls_after_response(
+    assistant_message: JsonObject,
+    later_messages: tuple[JsonObject, ...],
+) -> list[str]:
+    summaries: list[str] = []
+    tool_results = _tool_results_until_next_assistant(later_messages)
+    tool_calls = assistant_message.get("tool_calls")
+    if not isinstance(tool_calls, list):
+        return summaries
+
+    for tool_call in tool_calls:
+        name, arguments = _tool_call_name_and_arguments(tool_call)
+        if name is None or not isinstance(tool_call, dict):
+            continue
+        result = tool_results.get(tool_call.get("id"))
+        result_preview = ""
+        if result is not None:
+            result_preview = f" -> {_single_line(str(result.get('content', '')), limit=240)}"
+        summaries.append(f"{name}({arguments}){result_preview}")
+    return summaries
+
+
+def _summarize_tool_results_after_response(
+    assistant_message: JsonObject,
+    later_messages: tuple[JsonObject, ...],
+) -> list[str]:
+    summaries: list[str] = []
+    tool_results = _tool_results_until_next_assistant(later_messages)
+    tool_calls = assistant_message.get("tool_calls")
+    if not isinstance(tool_calls, list):
+        return summaries
+
+    for tool_call in tool_calls:
+        if not isinstance(tool_call, dict):
+            continue
+        result = tool_results.get(tool_call.get("id"))
+        if result is None:
+            continue
+        name = result.get("name") or _tool_call_name_and_arguments(tool_call)[0]
+        content = _single_line(str(result.get("content", "")), limit=240)
+        summaries.append(f"tool message for {name}: {content}")
+    return summaries
+
+
+def _tool_results_until_next_assistant(
+    messages: tuple[JsonObject, ...],
+) -> dict[Any, JsonObject]:
+    results: dict[Any, JsonObject] = {}
+    for message in messages:
+        if message.get("role") == "assistant":
+            break
+        if message.get("role") == "tool":
+            results[message.get("tool_call_id")] = message
+    return results
+
+
+def _tool_call_name_and_arguments(tool_call: Any) -> tuple[str | None, str]:
+    if not isinstance(tool_call, dict):
+        return None, "{}"
+    function = tool_call.get("function")
+    if not isinstance(function, dict):
+        return None, "{}"
+    name = function.get("name")
+    arguments = function.get("arguments", "{}")
+    if not isinstance(name, str):
+        return None, "{}"
+    if not isinstance(arguments, str):
+        arguments = json.dumps(arguments, sort_keys=True)
+    return name, _format_jsonish(arguments)
 
 
 def _format_jsonish(value: str) -> str:
@@ -290,19 +439,21 @@ async def async_main(argv: list[str] | None = None) -> int:
     _load_dotenv_if_available()
     settings = load_settings()
     configure_logging(settings.log_level, settings.log_json)
+    _quiet_chatty_client_logs()
 
     result = await run_agent(" ".join(args.prompt), settings=settings)
     if args.verbose:
-        print(f"Iterations: {result.iterations}")
-        trace_lines = format_tool_trace(result.messages)
-        if trace_lines:
-            print("Tool trace:")
-            for line in trace_lines:
-                print(line)
-        else:
-            print("Tool trace: none")
+        for line in format_agent_trace(result.messages):
+            print(line)
+        print("")
+        print("Final answer:")
     print(result.content)
     return 0
+
+
+def _quiet_chatty_client_logs() -> None:
+    for logger_name in ("httpx", "mcp.client.streamable_http"):
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
 
 
 def main() -> None:

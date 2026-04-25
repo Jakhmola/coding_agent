@@ -3,7 +3,7 @@ import unittest
 from dataclasses import replace
 from unittest.mock import patch
 
-from coding_agent.agent import format_tool_trace, mcp_tool_to_openai_tool, run_agent
+from coding_agent.agent import format_agent_trace, mcp_tool_to_openai_tool, run_agent
 from coding_agent.config import load_settings
 from coding_agent.model_client import ModelResponse, ModelToolCall
 
@@ -288,9 +288,11 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(converted["function"]["name"], "read")
         self.assertEqual(converted["function"]["parameters"]["type"], "object")
 
-    def test_formats_tool_trace_from_messages(self):
-        lines = format_tool_trace(
+    def test_formats_agent_trace_from_messages(self):
+        lines = format_agent_trace(
             (
+                {"role": "system", "content": "system prompt"},
+                {"role": "user", "content": "list files"},
                 {
                     "role": "assistant",
                     "content": None,
@@ -317,8 +319,21 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             lines,
             [
-                '- get_files_info({"directory": "."})',
-                "  result: - README.md: file_size=12 bytes, is_dir=False",
+                "Agent trace",
+                "User input: list files",
+                "Model turns: 1",
+                "Tool calls: 1",
+                "",
+                "Model turn 1",
+                "  Sent to model:",
+                "    - system prompt",
+                "    - user: list files",
+                "  Model response:",
+                '    - assistant requested tool: get_files_info({"directory": "."})',
+                "  Tool execution:",
+                '    - get_files_info({"directory": "."}) -> - README.md: file_size=12 bytes, is_dir=False',
+                "  Sent back to model next turn:",
+                "    - tool message for get_files_info: - README.md: file_size=12 bytes, is_dir=False",
             ],
         )
 

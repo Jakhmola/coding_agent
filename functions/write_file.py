@@ -1,42 +1,66 @@
-import os
+from pathlib import Path
 
-from google.genai import types
+from coding_agent.workspace_policy import WorkspacePolicy
 
 
-def write_file(working_directory: str, file_path: str, content: str) -> str:
+try:
+    from google.genai import types
+except ModuleNotFoundError:
+    types = None
+
+
+def _policy(working_directory: str | Path, policy: WorkspacePolicy | None) -> WorkspacePolicy:
+    return policy or WorkspacePolicy(root=Path(working_directory))
+
+
+def write_file(
+    working_directory: str | Path,
+    file_path: str,
+    content: str,
+    policy: WorkspacePolicy | None = None,
+) -> str:
+    workspace_policy = _policy(working_directory, policy)
+
     try:
-        working_path = os.path.abspath(working_directory)
-        full_path = os.path.abspath(os.path.join(working_path, file_path))
+        workspace_policy.ensure_write_allowed()
+        full_path = workspace_policy.resolve_path(file_path)
 
-        if not full_path.startswith(working_path):
-            return f'Error: Cannot write to "{file_path}" as it is outside the permitted working directory'
+        if len(content.encode()) > workspace_policy.max_file_size_bytes:
+            return f'Error: Content for "{file_path}" exceeds the maximum allowed size'
 
-        if not os.path.exists(os.path.dirname(full_path)):
-            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        full_path.parent.mkdir(parents=True, exist_ok=True)
 
-        with open(full_path, 'w') as f:
+        with full_path.open("w") as f:
             _ = f.write(content)
 
         return f'Successfully wrote to "{file_path}" ({len(content)} characters written)'
+    except ValueError:
+        return f'Error: Cannot write to "{file_path}" as it is outside the permitted working directory'
+    except PermissionError as e:
+        return f"Error: {e}"
     except Exception as e:
         return f"Error: {e}"
 
 
-schema_write_file = types.FunctionDeclaration(
-    name="write_file",
-    description="Writes content to a file within the working directory. Creates the file if it doesn't exist.",
-    parameters=types.Schema(
-        type=types.Type.OBJECT,
-        properties={
-            "file_path": types.Schema(
-                type=types.Type.STRING,
-                description="The file path to write the content to, relative to the working directory.",
-            ),
-            "content": types.Schema(
-                type=types.Type.STRING,
-                description="The content you want to write into a file.",
-            ),
-        },
-        required=["file_path", "content"],
-    ),
+schema_write_file = (
+    types.FunctionDeclaration(
+        name="write_file",
+        description="Writes content to a file within the working directory. Creates the file if it doesn't exist.",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "file_path": types.Schema(
+                    type=types.Type.STRING,
+                    description="The file path to write the content to, relative to the working directory.",
+                ),
+                "content": types.Schema(
+                    type=types.Type.STRING,
+                    description="The content you want to write into a file.",
+                ),
+            },
+            required=["file_path", "content"],
+        ),
+    )
+    if types
+    else None
 )

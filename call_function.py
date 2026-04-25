@@ -1,5 +1,6 @@
 from google.genai import types
 
+from coding_agent.config import load_settings
 from functions.get_file_content import get_file_content, schema_get_file_content
 from functions.get_files_info import get_files_info, schema_get_files_info
 from functions.run_python_file import run_python_file, schema_run_python_file
@@ -7,10 +8,14 @@ from functions.write_file import schema_write_file, write_file
 
 available_functions = types.Tool(
     function_declarations=[
-        schema_get_files_info,
-        schema_get_file_content,
-        schema_write_file,
-        schema_run_python_file,
+        schema
+        for schema in [
+            schema_get_files_info,
+            schema_get_file_content,
+            schema_write_file,
+            schema_run_python_file,
+        ]
+        if schema is not None
     ]
 )
 
@@ -20,9 +25,6 @@ callable_functions = {
     "write_file": write_file,
     "run_python_file": run_python_file,
 }
-
-working_dir = "./calculator"
-
 
 def call_function(function_call_part: types.FunctionCall, verbose: bool = False) -> None|types.Content:
     function_name = function_call_part.name
@@ -53,7 +55,12 @@ def call_function(function_call_part: types.FunctionCall, verbose: bool = False)
             ],
         )
 
-    function_result = func_to_run(working_dir, **function_args)
+    settings = load_settings()
+    function_result = func_to_run(
+        settings.workspace_policy.root,
+        policy=settings.workspace_policy,
+        **function_args,
+    )
     return types.Content(
         role="tool",
         parts=[

@@ -1,18 +1,19 @@
 import os
 import sys
-from call_function import available_functions, call_function
-from prompts import system_prompt
-from dotenv import load_dotenv
-from google import genai
-from google.genai import Client, types
+from typing import Any
 
-
-MODEL = "gemini-2.0-flash-001"
-MAX_ITERATIONS = 20
+from coding_agent.config import load_settings
 
 
 def main():
-    _ = load_dotenv()
+    try:
+        from dotenv import load_dotenv
+    except ModuleNotFoundError:
+        pass
+    else:
+        _ = load_dotenv()
+
+    settings = load_settings()
 
     verbose = "--verbose" in sys.argv
     args = [arg for arg in sys.argv[1:] if not arg.startswith("--")]
@@ -24,6 +25,9 @@ def main():
         sys.exit(1)
 
     api_key = os.environ.get("GEMINI_API_KEY")
+    from google import genai
+    from google.genai import types
+
     client = genai.Client(api_key=api_key)
 
     user_prompt = " ".join(args)
@@ -38,11 +42,13 @@ def main():
     i = 0
     while True:
         i += 1
-        if i > MAX_ITERATIONS:
-            print(f"Maximum iterations ({MAX_ITERATIONS}) reached.")
+        if i > settings.max_iterations:
+            print(f"Maximum iterations ({settings.max_iterations}) reached.")
             sys.exit(1)
         try:
-            final_response = generate_content(client, messages, verbose)
+            final_response = generate_content(
+                client, messages, verbose, settings.gemini_model
+            )
             if final_response:
                 print("Final response:")
                 print(final_response)
@@ -52,9 +58,18 @@ def main():
 
 
 
-def generate_content(client: Client, messages: list[types.Content], verbose: bool) -> None|str:
+def generate_content(
+    client: Any,
+    messages: list[Any],
+    verbose: bool,
+    model: str,
+) -> None|str:
+    from call_function import available_functions, call_function
+    from google.genai import types
+    from prompts import system_prompt
+
     resp = client.models.generate_content( # pyright:ignore[reportUnknownMemberType]
-        model=MODEL,
+        model=model,
         contents=messages,
         config=types.GenerateContentConfig(
             tools=[available_functions],

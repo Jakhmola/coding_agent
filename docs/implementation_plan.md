@@ -27,7 +27,7 @@ Default model: `qwen2.5-coder:7b-instruct-q4_0`, wrapped as `coding-qwen-gpu`.
 - [x] Slice 2: Harden current tools with workspace policy and focused tests.
 - [x] Slice 3: MCP server exposing current tools and system prompt.
 - [x] Slice 4: Ollama Docker service, Modelfile, model pull/check workflow.
-- [ ] Slice 5: OpenAI-compatible MCP-backed agent loop with mocked model tests.
+- [x] Slice 5: OpenAI-compatible MCP-backed agent loop with mocked model tests.
 - [ ] Slice 6: A2A HTTP wrapper and CLI commands.
 - [ ] Slice 7: Opik tracing hooks with clean disabled mode.
 - [ ] Slice 8: Docker Compose and Makefile workflow.
@@ -56,6 +56,20 @@ Status: complete in `coding_agent/mcp_server.py`. Smoke command:
 - Do not pull the model automatically during normal tests.
 
 Status: complete in `docker-compose.yml`, `models/`, `Makefile`, and `scripts/model_check.py`.
+
+## Slice 5 Acceptance Criteria
+
+- Add an OpenAI-compatible chat completions client for Ollama without requiring model calls in unit tests.
+- Add an MCP client adapter that can list tools, read the coding-agent system prompt, and call MCP tools over Streamable HTTP.
+- Add an agent loop that converts MCP tool schemas to OpenAI tool definitions, handles model tool calls, sends tool results back to the model, and stops on final assistant content.
+- Cover the loop with mocked model and MCP clients, including direct answers, tool use, multiple tool calls, malformed tool arguments, and max-iteration failure.
+- Keep the old direct Gemini CLI path intact until the later cleanup slice.
+
+Status: complete in `coding_agent/model_client.py`, `coding_agent/mcp_client.py`, and `coding_agent/agent.py`. Programmatic entry point:
+
+```bash
+.venv/bin/python -m coding_agent.agent "your prompt here"
+```
 
 ## Test Strategy
 

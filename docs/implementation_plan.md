@@ -1,0 +1,68 @@
+# MCP + A2A Coding Agent V1 Plan
+
+This is the living implementation plan for the coding agent upgrade. Keep the checklist updated as each slice lands so future work can resume without reconstructing context.
+
+## Target Architecture
+
+- `ollama`: local OpenAI-compatible model endpoint on GPU.
+- `mcp-server`: Streamable HTTP MCP server exposing prompts and current coding tools.
+- `a2a-agent`: A2A HTTP agent backed by the MCP client and local model.
+- `cli`: one-shot command wrapper that talks to the running A2A agent.
+- `opik`: optional tracing for CLI requests, A2A tasks, model calls, and MCP tool calls.
+
+Default model: `qwen2.5-coder:7b-instruct-q4_0`, wrapped as `coding-qwen-gpu`.
+
+## Key Decisions
+
+- Use Ollama instead of vLLM for v1 because it is simpler, OpenAI-compatible, Docker-friendly, and practical for Q4 models on a 6GB NVIDIA GPU.
+- Require the model to run fully on GPU. If `num_ctx 4096` spills to CPU, reduce once to `2048`; if it still spills, fail loudly and do not change model automatically.
+- Keep v1 tools limited to the current core set: list files, read file, write file, run Python file.
+- Defer extra tools and multi-agent roles until after v1 is stable.
+- Keep current direct Gemini path only as temporary compatibility until the OpenAI-compatible agent loop replaces it.
+- Protect local `.env`; only `.env.example` belongs in git.
+
+## Checklist
+
+- [x] Slice 1: Config, constants, structured logging foundation, workspace policy config, `.env.example`.
+- [x] Slice 2: Harden current tools with workspace policy and focused tests.
+- [x] Slice 3: MCP server exposing current tools and system prompt.
+- [ ] Slice 4: Ollama Docker service, Modelfile, model pull/check workflow.
+- [ ] Slice 5: OpenAI-compatible MCP-backed agent loop with mocked model tests.
+- [ ] Slice 6: A2A HTTP wrapper and CLI commands.
+- [ ] Slice 7: Opik tracing hooks with clean disabled mode.
+- [ ] Slice 8: Docker Compose and Makefile workflow.
+- [ ] Slice 9: Remove obsolete direct-dispatch code and update README.
+
+## Slice 3 Acceptance Criteria
+
+- Add an MCP server module that exposes the current four tools and the coding-agent system prompt.
+- Keep tool behavior backed by the already-hardened tool functions and `WorkspacePolicy`.
+- Add a smoke command or test path that can list MCP tools and prompt metadata without starting the full future stack.
+- Avoid model calls and avoid Docker work in this slice.
+- Keep existing tests passing.
+
+Status: complete in `coding_agent/mcp_server.py`. Smoke command:
+
+```bash
+.venv/bin/python -m coding_agent.mcp_server --list
+```
+
+## Test Strategy
+
+- Unit tests should avoid paid or remote model calls.
+- Use mocked model responses for future agent-loop tests.
+- Use MCP server/client smoke tests without involving Ollama.
+- Keep one local model smoke test for the later Ollama slice, only after GPU verification passes.
+
+## Current Validation Commands
+
+```bash
+python3 -m unittest discover -s tests -p 'test_*.py'
+python3 -m compileall -q coding_agent functions tests main.py call_function.py
+python3 main.py
+```
+
+## Notes
+
+- Existing local changes to `calculator/lorem.txt`, `pyproject.toml`, and `uv.lock` are user-owned unless a later slice explicitly adopts them.
+- If dependencies need to change, prefer updating `pyproject.toml` intentionally in the slice that needs them and explain why.

@@ -44,7 +44,8 @@ other-model   abc123    5.0 GB    100% GPU     4 minutes from now
                 "run",
                 "coding-qwen-gpu",
                 "Respond with only: ok",
-            ]
+            ],
+            "warm model",
         )
 
     @patch("scripts.model_check._run_streaming")
@@ -63,7 +64,8 @@ other-model   abc123    5.0 GB    100% GPU     4 minutes from now
                 "coding-qwen-gpu",
                 "-f",
                 "/models/Modelfile",
-            ]
+            ],
+            "create model from /models/Modelfile",
         )
 
 

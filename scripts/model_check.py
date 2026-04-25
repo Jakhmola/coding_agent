@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
+import json
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 
 
 HEARTBEAT_SECONDS = 10
@@ -35,13 +39,48 @@ def _compose_exec(compose: str, service: str, command: list[str]) -> list[str]:
     return [*compose.split(), "exec", "-T", service, *command]
 
 
-def _warm_model(compose: str, service: str, model: str) -> None:
-    _run_streaming(
-        _compose_exec(
-            compose,
-            service,
-            ["ollama", "run", model, "Respond with only: ok"],
-        ),
+def _post_with_heartbeat(url: str, payload: dict[str, object], label: str) -> None:
+    body = json.dumps(payload).encode()
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    print(f"{label}: POST {url}", flush=True)
+    started_at = time.monotonic()
+    next_heartbeat = started_at + HEARTBEAT_SECONDS
+
+    def send_request() -> None:
+        try:
+            with urllib.request.urlopen(request) as response:
+                response.read()
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"{label} failed: {exc}") from exc
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(send_request)
+        while not future.done():
+            elapsed = int(time.monotonic() - started_at)
+            if time.monotonic() >= next_heartbeat:
+                print(f"{label}: still running after {elapsed}s...", flush=True)
+                next_heartbeat = time.monotonic() + HEARTBEAT_SECONDS
+            time.sleep(1)
+        future.result()
+
+
+def _warm_model(ollama_url: str, model: str) -> None:
+    _post_with_heartbeat(
+        f"{ollama_url.rstrip('/')}/api/generate",
+        {
+            "model": model,
+            "prompt": "Respond with only: ok",
+            "stream": False,
+            "keep_alive": -1,
+            "options": {
+                "num_predict": 1,
+            },
+        },
         "warm model",
     )
 
@@ -71,6 +110,7 @@ def check_model(
     model: str,
     model_file: str,
     lowctx_model_file: str,
+    ollama_url: str,
 ) -> int:
     print(f"checking model {model} with default context", flush=True)
     _recreate_model(compose, service, model, model_file)
@@ -78,7 +118,7 @@ def check_model(
         f"warming model {model}; loading weights into VRAM can take a while",
         flush=True,
     )
-    _warm_model(compose, service, model)
+    _warm_model(ollama_url, model)
     print("checking Ollama residency with `ollama ps`", flush=True)
     ps_output = _ollama_ps(compose, service)
     print(ps_output)
@@ -97,7 +137,7 @@ def check_model(
         f"warming reduced-context model {model}; loading weights into VRAM can take a while",
         flush=True,
     )
-    _warm_model(compose, service, model)
+    _warm_model(ollama_url, model)
     print("checking Ollama residency with `ollama ps`", flush=True)
     ps_output = _ollama_ps(compose, service)
     print(ps_output)
@@ -123,6 +163,7 @@ def main() -> int:
     parser.add_argument("--model", default="coding-qwen-gpu")
     parser.add_argument("--model-file", default="/models/Modelfile")
     parser.add_argument("--lowctx-model-file", default="/models/Modelfile.lowctx")
+    parser.add_argument("--ollama-url", default="http://localhost:11434")
     args = parser.parse_args()
 
     try:
@@ -132,6 +173,7 @@ def main() -> int:
             args.model,
             args.model_file,
             args.lowctx_model_file,
+            args.ollama_url,
         )
     except subprocess.CalledProcessError as exc:
         print(exc.stdout, end="")

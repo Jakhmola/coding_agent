@@ -1,4 +1,5 @@
 FROM qwen2.5-coder:7b-instruct-q4_0
 
 PARAMETER num_ctx 4096
+PARAMETER num_gpu 999
 

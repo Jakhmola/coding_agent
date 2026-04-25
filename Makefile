@@ -2,6 +2,7 @@ SHELL := /usr/bin/env bash
 
 COMPOSE ?= docker compose
 OLLAMA_SERVICE ?= ollama
+OLLAMA_URL ?= http://localhost:11434
 OLLAMA_MODEL ?= coding-qwen-gpu
 OLLAMA_BASE_MODEL ?= qwen2.5-coder:7b-instruct-q4_0
 MODELFILE ?= models/Modelfile
@@ -26,8 +27,7 @@ ollama-down:
 	$(COMPOSE) stop $(OLLAMA_SERVICE)
 
 model-pull: ollama-up
-	$(COMPOSE) exec $(OLLAMA_SERVICE) ollama pull $(OLLAMA_BASE_MODEL)
-	$(COMPOSE) exec $(OLLAMA_SERVICE) ollama create $(OLLAMA_MODEL) -f /models/Modelfile
+	OLLAMA_MODEL=$(OLLAMA_MODEL) OLLAMA_BASE_MODEL=$(OLLAMA_BASE_MODEL) $(COMPOSE) run --rm ollama-init
 
 model-check: ollama-up
 	python3 scripts/model_check.py \
@@ -35,11 +35,11 @@ model-check: ollama-up
 		--service "$(OLLAMA_SERVICE)" \
 		--model "$(OLLAMA_MODEL)" \
 		--model-file "/models/Modelfile" \
-		--lowctx-model-file "/models/Modelfile.lowctx"
+		--lowctx-model-file "/models/Modelfile.lowctx" \
+		--ollama-url "$(OLLAMA_URL)"
 
 compose-check:
 	$(COMPOSE) config --quiet
 
 test:
 	python3 -m unittest discover -s tests -p 'test_*.py'
-

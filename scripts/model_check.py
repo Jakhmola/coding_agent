@@ -9,12 +9,16 @@ def _run(command: list[str], *, check: bool = True) -> subprocess.CompletedProce
     return subprocess.run(command, capture_output=True, text=True, check=check)
 
 
+def _run_streaming(command: list[str]) -> None:
+    subprocess.run(command, check=True)
+
+
 def _compose_exec(compose: str, service: str, command: list[str]) -> list[str]:
     return [*compose.split(), "exec", "-T", service, *command]
 
 
 def _warm_model(compose: str, service: str, model: str) -> None:
-    _run(
+    _run_streaming(
         _compose_exec(
             compose,
             service,
@@ -36,7 +40,9 @@ def _is_fully_gpu(ps_output: str, model: str) -> bool:
 
 
 def _recreate_model(compose: str, service: str, model: str, model_file: str) -> None:
-    _run(_compose_exec(compose, service, ["ollama", "create", model, "-f", model_file]))
+    _run_streaming(
+        _compose_exec(compose, service, ["ollama", "create", model, "-f", model_file])
+    )
 
 
 def check_model(

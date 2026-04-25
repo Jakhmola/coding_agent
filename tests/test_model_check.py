@@ -1,6 +1,7 @@
 import unittest
+from unittest.mock import patch
 
-from scripts.model_check import _is_fully_gpu
+from scripts.model_check import _is_fully_gpu, _recreate_model, _warm_model
 
 
 class ModelCheckTests(unittest.TestCase):
@@ -27,6 +28,43 @@ other-model   abc123    5.0 GB    100% GPU     4 minutes from now
 """
 
         self.assertFalse(_is_fully_gpu(ps_output, "coding-qwen-gpu"))
+
+    @patch("scripts.model_check._run_streaming")
+    def test_warm_model_streams_progress(self, run_streaming):
+        _warm_model("docker compose", "ollama", "coding-qwen-gpu")
+
+        run_streaming.assert_called_once_with(
+            [
+                "docker",
+                "compose",
+                "exec",
+                "-T",
+                "ollama",
+                "ollama",
+                "run",
+                "coding-qwen-gpu",
+                "Respond with only: ok",
+            ]
+        )
+
+    @patch("scripts.model_check._run_streaming")
+    def test_recreate_model_streams_progress(self, run_streaming):
+        _recreate_model("docker compose", "ollama", "coding-qwen-gpu", "/models/Modelfile")
+
+        run_streaming.assert_called_once_with(
+            [
+                "docker",
+                "compose",
+                "exec",
+                "-T",
+                "ollama",
+                "ollama",
+                "create",
+                "coding-qwen-gpu",
+                "-f",
+                "/models/Modelfile",
+            ]
+        )
 
 
 if __name__ == "__main__":

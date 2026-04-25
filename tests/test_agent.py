@@ -3,7 +3,7 @@ import unittest
 from dataclasses import replace
 from unittest.mock import patch
 
-from coding_agent.agent import mcp_tool_to_openai_tool, run_agent
+from coding_agent.agent import format_tool_trace, mcp_tool_to_openai_tool, run_agent
 from coding_agent.config import load_settings
 from coding_agent.model_client import ModelResponse, ModelToolCall
 
@@ -148,6 +148,28 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.content, "files checked")
         self.assertEqual(tools.calls, [("get_files_info", {"directory": "."})])
 
+    async def test_coerces_first_json_tool_request_when_model_adds_extra_text(self):
+        model = FakeModelClient(
+            [
+                ModelResponse(
+                    '{"name": "get_files_info", "arguments": {"directory": "."}}\n'
+                    '{"name": "missing_tool", "arguments": {}}'
+                ),
+                ModelResponse("files checked"),
+            ]
+        )
+        tools = FakeToolClient()
+
+        result = await run_agent(
+            "list files",
+            settings=_settings(),
+            model_client=model,
+            tool_client=tools,
+        )
+
+        self.assertEqual(result.content, "files checked")
+        self.assertEqual(tools.calls, [("get_files_info", {"directory": "."})])
+
     async def test_calls_multiple_tools_from_one_assistant_turn(self):
         model = FakeModelClient(
             [
@@ -265,6 +287,40 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(converted["type"], "function")
         self.assertEqual(converted["function"]["name"], "read")
         self.assertEqual(converted["function"]["parameters"]["type"], "object")
+
+    def test_formats_tool_trace_from_messages(self):
+        lines = format_tool_trace(
+            (
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "get_files_info",
+                                "arguments": '{"directory": "."}',
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "name": "get_files_info",
+                    "content": "- README.md: file_size=12 bytes, is_dir=False",
+                },
+            )
+        )
+
+        self.assertEqual(
+            lines,
+            [
+                '- get_files_info({"directory": "."})',
+                "  result: - README.md: file_size=12 bytes, is_dir=False",
+            ],
+        )
 
 
 def _settings():

@@ -176,8 +176,9 @@ def _coerce_text_tool_call(
 
 
 def _parse_text_tool_payload(content: str) -> JsonObject | None:
+    decoder = json.JSONDecoder()
     try:
-        payload = json.loads(content)
+        payload, _ = decoder.raw_decode(content)
     except json.JSONDecodeError:
         fixed_content = re.sub(
             r'("name"\s*:\s*)([A-Za-z_][A-Za-z0-9_.-]*)',
@@ -188,7 +189,7 @@ def _parse_text_tool_payload(content: str) -> JsonObject | None:
         if fixed_content == content:
             return None
         try:
-            payload = json.loads(fixed_content)
+            payload, _ = decoder.raw_decode(fixed_content)
         except json.JSONDecodeError:
             return None
 
@@ -216,6 +217,60 @@ async def _call_tool(tool_client: ToolClient, tool_call: ModelToolCall) -> str:
     return await tool_client.call_tool(tool_call.name, arguments)
 
 
+def format_tool_trace(messages: tuple[JsonObject, ...]) -> list[str]:
+    lines: list[str] = []
+    tool_results = {
+        message.get("tool_call_id"): message
+        for message in messages
+        if message.get("role") == "tool"
+    }
+
+    for message in messages:
+        tool_calls = message.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            continue
+
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+            function = tool_call.get("function")
+            if not isinstance(function, dict):
+                continue
+
+            call_id = tool_call.get("id")
+            name = function.get("name")
+            arguments = function.get("arguments", "{}")
+            if not isinstance(name, str):
+                continue
+            if not isinstance(arguments, str):
+                arguments = json.dumps(arguments, sort_keys=True)
+
+            pretty_args = _format_jsonish(arguments)
+            lines.append(f"- {name}({pretty_args})")
+
+            result = tool_results.get(call_id)
+            if result is not None:
+                preview = _single_line(str(result.get("content", "")), limit=240)
+                lines.append(f"  result: {preview}")
+
+    return lines
+
+
+def _format_jsonish(value: str) -> str:
+    try:
+        parsed = json.loads(value or "{}")
+    except json.JSONDecodeError:
+        return value
+    return json.dumps(parsed, sort_keys=True)
+
+
+def _single_line(value: str, *, limit: int) -> str:
+    compact = " ".join(value.split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 3] + "..."
+
+
 def _load_dotenv_if_available() -> None:
     try:
         from dotenv import load_dotenv
@@ -239,6 +294,13 @@ async def async_main(argv: list[str] | None = None) -> int:
     result = await run_agent(" ".join(args.prompt), settings=settings)
     if args.verbose:
         print(f"Iterations: {result.iterations}")
+        trace_lines = format_tool_trace(result.messages)
+        if trace_lines:
+            print("Tool trace:")
+            for line in trace_lines:
+                print(line)
+        else:
+            print("Tool trace: none")
     print(result.content)
     return 0
 

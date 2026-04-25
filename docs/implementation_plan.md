@@ -72,6 +72,8 @@ Status: complete in `coding_agent/model_client.py`, `coding_agent/mcp_client.py`
 .venv/bin/python -m coding_agent.agent "your prompt here"
 ```
 
+Use `--verbose` to print the iteration count plus a tool trace showing each tool name, arguments, and a short result preview.
+
 Local smoke validation passed with `coding-qwen-gpu` loaded `100% GPU`:
 
 ```bash

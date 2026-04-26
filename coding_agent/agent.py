@@ -38,7 +38,7 @@ def _load_dotenv_if_available() -> None:
         from dotenv import load_dotenv
     except ModuleNotFoundError:
         return
-    load_dotenv()
+    load_dotenv(".env")
 
 
 async def async_main(argv: list[str] | None = None) -> int:

@@ -519,6 +519,66 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(review_events[-1]["reason"], "evidence_summary")
 
+    async def test_project_overview_empty_response_ignores_trailing_tool_error(self):
+        model = FakeModelClient(
+            [
+                ModelResponse(
+                    None,
+                    (
+                        ModelToolCall(
+                            id="call_1",
+                            name="get_files_info",
+                            arguments='{"directory": "."}',
+                        ),
+                    ),
+                ),
+                ModelResponse(
+                    None,
+                    (
+                        ModelToolCall(
+                            id="call_2",
+                            name="get_file_content",
+                            arguments='{"file_path": "README.md"}',
+                        ),
+                        ModelToolCall(
+                            id="call_3",
+                            name="get_file_content",
+                            arguments='{"file_path": "main.py"}',
+                        ),
+                    ),
+                ),
+                ModelResponse(
+                    None,
+                    (
+                        ModelToolCall(
+                            id="call_4",
+                            name="get_file_content",
+                            arguments='{"file_path": "pkg"}',
+                        ),
+                    ),
+                ),
+                ModelResponse(""),
+            ]
+        )
+        tools = ProjectToolClient()
+
+        result = await run_agent(
+            "what is the project even about",
+            settings=_settings(),
+            model_client=model,
+            tool_client=tools,
+        )
+
+        self.assertIn("command-line calculator app", result.content)
+        self.assertNotIn("Error: File not found", result.content)
+        review_events = [
+            event for event in result.events if event["type"] == "review_completed"
+        ]
+        self.assertEqual(
+            review_events[-1]["reason"],
+            "evidence_summary_after_empty_response",
+        )
+
     async def test_coerces_tool_request_with_unquoted_name_value(self):
         model = FakeModelClient(
             [

@@ -11,3 +11,6 @@ wheels/
 
 # Local environment files
 .env
+
+# Local runtime state
+.run/

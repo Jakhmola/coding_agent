@@ -536,12 +536,17 @@ def _build_graph(
                     reason = "blocked"
             elif final_answer is not None:
                 if not final_answer.strip():
-                    fallback_answer = _fallback_final_answer(state)
+                    fallback_answer = _safe_read_fallback_answer(state)
                     if fallback_answer is not None:
                         final_answer = fallback_answer
-                        reason = "fallback_tool_result"
+                        reason = "evidence_summary_after_empty_response"
                     else:
-                        reason = "model_final"
+                        fallback_answer = _fallback_final_answer(state)
+                        if fallback_answer is not None:
+                            final_answer = fallback_answer
+                            reason = "fallback_tool_result"
+                        else:
+                            reason = "model_final"
                 elif _looks_like_tool_call_leak(final_answer):
                     fallback_answer = _safe_read_fallback_answer(state)
                     if fallback_answer is not None:

@@ -175,14 +175,8 @@ def _build_graph(
             _tool_call_to_dict(tool_call)
             for tool_call in response.tool_calls
         ]
-        events = _append_event(
-            state,
-            "model_called",
-            turn=state["turn_count"] + 1,
-            message_count=len(state["messages"]),
-        )
         events = _append_event_to_list(
-            events,
+            state["events"],
             "model_responded",
             turn=state["turn_count"] + 1,
             content=response.content,
@@ -385,15 +379,15 @@ def _initial_state(user_prompt: str) -> CodingAgentState:
 
 def classify_intent(user_prompt: str) -> Intent:
     prompt = user_prompt.lower()
-    if _contains_any(prompt, ("write", "create", "save", "edit", "modify", "delete", "overwrite")):
-        return "write"
-    if _contains_any(prompt, ("run", "execute", "test", "pytest", "unittest")):
-        return "run"
-    if _contains_any(prompt, ("commit", "push", "branch", "status", "diff", "merge")):
-        return "git"
-    if _contains_any(prompt, ("install", "dependency", "package", "pip", "uv add")):
+    if _contains_word_any(prompt, ("install", "dependency", "package", "pip")) or _contains_any(prompt, ("uv add",)):
         return "dependency"
-    if _contains_any(prompt, ("print", "show", "read", "cat", "display", "list", "summarize")):
+    if _contains_word_any(prompt, ("write", "create", "save", "edit", "modify", "delete", "overwrite", "add", "append", "insert")):
+        return "write"
+    if _contains_word_any(prompt, ("run", "execute", "test", "pytest", "unittest")):
+        return "run"
+    if _contains_word_any(prompt, ("commit", "push", "branch", "status", "diff", "merge")):
+        return "git"
+    if _contains_word_any(prompt, ("print", "show", "read", "cat", "display", "list", "summarize")):
         return "read_only"
     return "unknown"
 
@@ -632,8 +626,6 @@ def _format_event(event: JsonObject) -> str:
         return f"intent_classified intent={event.get('intent')} risk={event.get('risk_level')}"
     if event_type == "plan_created":
         return f"plan_created allowed_tools={event.get('allowed_tools')}"
-    if event_type == "model_called":
-        return f"model_called turn={event.get('turn')} message_count={event.get('message_count')}"
     if event_type == "model_responded":
         content = _single_line(str(event.get("content") or ""), limit=160)
         tool_calls = event.get("tool_calls") or []
@@ -676,6 +668,10 @@ def _format_json(value: Any) -> str:
 
 def _contains_any(value: str, needles: tuple[str, ...]) -> bool:
     return any(needle in value for needle in needles)
+
+
+def _contains_word_any(value: str, words: tuple[str, ...]) -> bool:
+    return any(re.search(rf"\b{re.escape(word)}\b", value) for word in words)
 
 
 def _single_line(value: str, *, limit: int) -> str:

@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from coding_agent.agent import format_agent_trace, mcp_tool_to_openai_tool, run_agent
 from coding_agent.config import load_settings
-from coding_agent.workflow import AgentResult
+from coding_agent.workflow import AgentResult, classify_intent
 from coding_agent.model_client import ModelResponse, ModelToolCall
 
 try:
@@ -94,6 +94,13 @@ class ErrorToolClient(FakeToolClient):
 class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         asyncio.get_running_loop().slow_callback_duration = 1.0
+
+    def test_classifies_add_prompt_as_write_intent(self):
+        self.assertEqual(
+            classify_intent("add 'this is a new line' to lrem.txt"),
+            "write",
+        )
+        self.assertEqual(classify_intent("uv add langgraph"), "dependency")
 
     async def test_returns_direct_final_answer(self):
         model = FakeModelClient([ModelResponse("done")])
@@ -452,6 +459,38 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             tools.calls,
             [("write_file", {"file_path": "content.txt", "content": "new_text"})],
+        )
+
+    async def test_explicit_add_prompt_allows_write_file(self):
+        model = FakeModelClient(
+            [
+                ModelResponse(
+                    None,
+                    (
+                        ModelToolCall(
+                            id="call_1",
+                            name="write_file",
+                            arguments='{"file_path": "lorem.txt", "content": "new_text"}',
+                        ),
+                    ),
+                ),
+                ModelResponse("added it"),
+            ]
+        )
+        tools = FakeToolClient()
+
+        result = await run_agent(
+            "add new_text to lorem.txt",
+            settings=_settings(),
+            model_client=model,
+            tool_client=tools,
+        )
+
+        self.assertEqual(result.content, "added it")
+        self.assertEqual(result.tool_call_count, 1)
+        self.assertEqual(
+            tools.calls,
+            [("write_file", {"file_path": "lorem.txt", "content": "new_text"})],
         )
 
     async def test_explicit_run_prompt_allows_run_python_file(self):

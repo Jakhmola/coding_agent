@@ -6,7 +6,8 @@ This is the living implementation plan for the coding agent upgrade. Keep the ch
 
 - `llama.cpp`: local OpenAI-compatible model endpoint on GPU.
 - `mcp-server`: Streamable HTTP MCP server exposing prompts and current coding tools.
-- `a2a-agent`: A2A HTTP agent backed by the MCP client and local model.
+- `workflow`: LangGraph internal coding workflow backed by the MCP client and local model.
+- `a2a-agent`: future A2A HTTP wrapper around the internal workflow.
 - `cli`: one-shot command wrapper that talks to the running A2A agent.
 - `opik`: optional tracing for CLI requests, A2A tasks, model calls, and MCP tool calls.
 
@@ -17,7 +18,8 @@ Default model: `WithinUsAI/Opus4.7-GODs.Ghost.Codex-4B.GGuF`, using `Opus4.7-Dis
 - Use llama.cpp for v1 because it can serve GGUF models directly, remains OpenAI-compatible, is Docker-friendly, and gives explicit control over CUDA offload.
 - Require the model to run with `--n-gpu-layers all`. If `ctx-size 4096` fails to start or fails the smoke checks, reduce once to `2048`; if it still fails, fail loudly and do not fall back silently.
 - Keep v1 tools limited to the current core set: list files, read file, write file, run Python file.
-- Defer extra tools and multi-agent roles until after v1 is stable.
+- Use a hybrid LangGraph state: explicit routing fields plus append-only events for trace/debug and future A2A streaming.
+- Defer extra tools and multi-agent roles until the internal workflow policy is stable.
 - Keep current direct Gemini path only as temporary compatibility until the OpenAI-compatible agent loop replaces it.
 - Protect local `.env`; only `.env.example` belongs in git.
 
@@ -28,10 +30,11 @@ Default model: `WithinUsAI/Opus4.7-GODs.Ghost.Codex-4B.GGuF`, using `Opus4.7-Dis
 - [x] Slice 3: MCP server exposing current tools and system prompt.
 - [x] Slice 4: llama.cpp Docker service and model check workflow.
 - [x] Slice 5: OpenAI-compatible MCP-backed agent loop with mocked model tests.
-- [ ] Slice 6: A2A HTTP wrapper and CLI commands.
-- [ ] Slice 7: Opik tracing hooks with clean disabled mode.
-- [ ] Slice 8: Docker Compose and Makefile workflow.
-- [ ] Slice 9: Remove obsolete direct-dispatch code and update README.
+- [x] Slice 6: Hybrid LangGraph internal workflow and tool policy.
+- [ ] Slice 7: A2A HTTP wrapper and CLI commands.
+- [ ] Slice 8: Opik tracing hooks with clean disabled mode.
+- [ ] Slice 9: Docker Compose and Makefile workflow.
+- [ ] Slice 10: Remove obsolete direct-dispatch code and update README.
 
 ## Slice 3 Acceptance Criteria
 
@@ -82,6 +85,24 @@ make model-check
 .venv/bin/python -m coding_agent.agent --verbose "Use the available tool to list files in . and summarize what this project is."
 .venv/bin/python -m coding_agent.agent --verbose "Use the available tool to read README.md. After reading it, answer with only the first Markdown heading from that file."
 ```
+
+## Slice 6 Acceptance Criteria
+
+- Replace the single-loop agent internals with a raw LangGraph `StateGraph` while preserving the public `run_agent(...)` entry point.
+- Use a hybrid state model with explicit routing fields and append-only events.
+- Classify intent deterministically for read-only, write, run, git, dependency, and unknown requests.
+- Enforce tool policy before MCP execution: read tools are allowed broadly, `write_file` requires write intent, and `run_python_file` requires run intent.
+- Stop direct file-content requests after a successful `get_file_content` result instead of asking the model for more tool calls.
+- Render verbose CLI output from structured workflow events.
+- Do not add new tools, A2A, or human approval interrupts in this slice.
+
+Status: complete in `coding_agent/workflow.py` and `coding_agent/agent.py`. Regression target:
+
+```bash
+.venv/bin/python -m coding_agent.agent --verbose "print lorem.txt file content"
+```
+
+Expected behavior: one `get_file_content` call, no `write_file`, and final answer is the file content.
 
 ## Test Strategy
 

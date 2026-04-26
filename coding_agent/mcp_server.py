@@ -7,9 +7,13 @@ from typing import Any
 
 from coding_agent.config import Settings, load_settings
 from coding_agent.logging import configure_logging, get_logger
+from functions.append_file import append_file
 from functions.get_file_content import get_file_content
 from functions.get_files_info import get_files_info
+from functions.grep_files import grep_files
+from functions.replace_in_file import replace_in_file
 from functions.run_python_file import run_python_file
+from functions.search_files import search_files
 from functions.write_file import write_file
 from prompts import system_prompt
 
@@ -72,6 +76,80 @@ def build_mcp_server(settings: Settings | None = None) -> Any:
     )
     def mcp_get_file_content(file_path: str) -> str:
         return get_file_content(policy.root, file_path, policy=policy)
+
+    @server.tool(
+        name="search_files",
+        description="Recursively search workspace file and directory names by glob or substring.",
+    )
+    def mcp_search_files(
+        pattern: str,
+        directory: str = ".",
+        max_results: int = 50,
+    ) -> str:
+        return search_files(
+            policy.root,
+            pattern,
+            directory=directory,
+            max_results=max_results,
+            policy=policy,
+        )
+
+    @server.tool(
+        name="grep_files",
+        description="Search file contents by regex within workspace limits.",
+    )
+    def mcp_grep_files(
+        pattern: str,
+        directory: str = ".",
+        file_pattern: str = "*",
+        case_sensitive: bool = False,
+        max_results: int = 50,
+    ) -> str:
+        return grep_files(
+            policy.root,
+            pattern,
+            directory=directory,
+            file_pattern=file_pattern,
+            case_sensitive=case_sensitive,
+            max_results=max_results,
+            policy=policy,
+        )
+
+    @server.tool(
+        name="append_file",
+        description="Append content to a workspace file without replacing existing content.",
+    )
+    def mcp_append_file(
+        file_path: str,
+        content: str,
+        add_trailing_newline: bool = True,
+    ) -> str:
+        return append_file(
+            policy.root,
+            file_path,
+            content,
+            add_trailing_newline=add_trailing_newline,
+            policy=policy,
+        )
+
+    @server.tool(
+        name="replace_in_file",
+        description="Replace exact text in a workspace file, failing if match count differs.",
+    )
+    def mcp_replace_in_file(
+        file_path: str,
+        old_text: str,
+        new_text: str,
+        expected_replacements: int = 1,
+    ) -> str:
+        return replace_in_file(
+            policy.root,
+            file_path,
+            old_text,
+            new_text,
+            expected_replacements=expected_replacements,
+            policy=policy,
+        )
 
     @server.tool(
         name="write_file",

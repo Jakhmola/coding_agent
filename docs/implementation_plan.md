@@ -17,9 +17,9 @@ Default model: `WithinUsAI/Opus4.7-GODs.Ghost.Codex-4B.GGuF`, using `Opus4.7-Dis
 
 - Use llama.cpp for v1 because it can serve GGUF models directly, remains OpenAI-compatible, is Docker-friendly, and gives explicit control over CUDA offload.
 - Require the model to run with `--n-gpu-layers all`. If `ctx-size 4096` fails to start or fails the smoke checks, reduce once to `2048`; if it still fails, fail loudly and do not fall back silently.
-- Keep v1 tools limited to the current core set: list files, read file, write file, run Python file.
+- Keep tool growth policy-driven: read/search tools are broadly safe, precise edit tools are preferred before full-file writes, and command tools remain tightly gated.
 - Use a hybrid LangGraph state: explicit routing fields plus append-only events for trace/debug and future A2A streaming.
-- Defer extra tools and multi-agent roles until the internal workflow policy is stable.
+- Defer A2A and multi-agent roles until the internal workflow policy is stable.
 - Keep current direct Gemini path only as temporary compatibility until the OpenAI-compatible agent loop replaces it.
 - Protect local `.env`; only `.env.example` belongs in git.
 
@@ -31,10 +31,11 @@ Default model: `WithinUsAI/Opus4.7-GODs.Ghost.Codex-4B.GGuF`, using `Opus4.7-Dis
 - [x] Slice 4: llama.cpp Docker service and model check workflow.
 - [x] Slice 5: OpenAI-compatible MCP-backed agent loop with mocked model tests.
 - [x] Slice 6: Hybrid LangGraph internal workflow and tool policy.
-- [ ] Slice 7: A2A HTTP wrapper and CLI commands.
-- [ ] Slice 8: Opik tracing hooks with clean disabled mode.
-- [ ] Slice 9: Docker Compose and Makefile workflow.
-- [ ] Slice 10: Remove obsolete direct-dispatch code and update README.
+- [x] Slice 7: Safer search/edit tools and node-specific executor prompting.
+- [ ] Slice 8: A2A HTTP wrapper and CLI commands.
+- [ ] Slice 9: Opik tracing hooks with clean disabled mode.
+- [ ] Slice 10: Docker Compose and Makefile workflow.
+- [ ] Slice 11: Remove obsolete direct-dispatch code and update README.
 
 ## Slice 3 Acceptance Criteria
 
@@ -104,6 +105,20 @@ Status: complete in `coding_agent/workflow.py` and `coding_agent/agent.py`. Regr
 
 Expected behavior: one `get_file_content` call, no `write_file`, and final answer is the file content.
 
+## Slice 7 Acceptance Criteria
+
+- Add safer workspace tools: `search_files`, `grep_files`, `append_file`, and `replace_in_file`.
+- Register the new tools on the MCP server and keep direct tool behavior covered by unit tests.
+- Expand workflow plans with allowed tools, forbidden tools, preferred tools, expected write paths, max tool calls, and completion signals.
+- Filter tools sent to the executor model based on the current plan.
+- Add executor-node instructions that tell the model which tools are preferred and which tools are forbidden for the current request.
+- Prefer `append_file` for add/append/insert requests and `replace_in_file` for exact edit requests.
+- Block broad `write_file` use when a narrower edit tool is appropriate.
+- Block writes to a different path when the prompt names a specific expected write target.
+- Keep read-only prompts able to use search and grep while still blocking writes and runs.
+
+Status: complete in `coding_agent/workflow.py`, `coding_agent/mcp_server.py`, `functions/`, `prompts.py`, and tests.
+
 ## Test Strategy
 
 - Unit tests should avoid paid or remote model calls.
@@ -115,7 +130,8 @@ Expected behavior: one `get_file_content` call, no `write_file`, and final answe
 
 ```bash
 python3 -m unittest discover -s tests -p 'test_*.py'
-python3 -m compileall -q coding_agent functions tests main.py call_function.py
+python3 -m compileall -q coding_agent functions tests main.py call_function.py scripts/model_check.py
+make compose-check
 make llama-up
 make model-check
 ```

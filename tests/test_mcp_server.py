@@ -21,6 +21,10 @@ class McpServerTests(unittest.TestCase):
                 {
                     "get_files_info",
                     "get_file_content",
+                    "search_files",
+                    "grep_files",
+                    "append_file",
+                    "replace_in_file",
                     "write_file",
                     "run_python_file",
                 },
@@ -43,4 +47,3 @@ class McpServerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

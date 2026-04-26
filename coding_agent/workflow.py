@@ -9,12 +9,21 @@ from uuid import uuid4
 from coding_agent.config import Settings, load_settings
 from coding_agent.mcp_client import McpClient
 from coding_agent.model_client import ModelResponse, ModelToolCall, OpenAIChatClient
+from prompts import (
+    build_base_system_prompt,
+    build_executor_node_prompt,
+    build_final_response_prompt,
+    build_repair_node_prompt,
+)
 
 
 JsonObject = dict[str, Any]
 Intent = Literal["read_only", "write", "run", "git", "dependency", "unknown"]
 RiskLevel = Literal["safe", "side_effect", "dangerous"]
 Route = Literal["model_step", "final_response", "failure_response"]
+READ_TOOLS = {"get_files_info", "get_file_content", "search_files", "grep_files"}
+WRITE_TOOLS = {"append_file", "replace_in_file", "write_file"}
+RUN_TOOLS = {"run_python_file"}
 
 
 class ModelClient(Protocol):
@@ -77,20 +86,12 @@ async def run_workflow(
         mcp_tool_to_openai_tool(tool)
         for tool in await tool_client.list_tools()
     ]
-    tool_names = {
-        tool["function"]["name"]
-        for tool in tools
-        if isinstance(tool.get("function"), dict)
-        and isinstance(tool["function"].get("name"), str)
-    }
-
     graph = _build_graph(
         settings=settings,
         model_client=model_client,
         tool_client=tool_client,
         system_prompt=system_prompt,
         tools=tools,
-        tool_names=tool_names,
     )
     final_state = await graph.ainvoke(_initial_state(user_prompt))
     final_answer = final_state.get("final_answer") or final_state.get("blocked_reason")
@@ -115,7 +116,6 @@ def _build_graph(
     tool_client: ToolClient,
     system_prompt: str,
     tools: list[JsonObject],
-    tool_names: set[str],
 ) -> Any:
     try:
         from langgraph.graph import END, START, StateGraph
@@ -128,7 +128,7 @@ def _build_graph(
     async def intake(state: CodingAgentState) -> JsonObject:
         return {
             "messages": [
-                {"role": "system", "content": system_prompt},
+                {"role": "system", "content": build_base_system_prompt(system_prompt)},
                 {"role": "user", "content": state["user_prompt"]},
             ],
             "events": _append_event(
@@ -153,22 +153,20 @@ def _build_graph(
         }
 
     async def planner(state: CodingAgentState) -> JsonObject:
-        allowed_tools = sorted(_allowed_tools_for_intent(state["intent"]))
-        plan = {
-            "goal": state["user_prompt"],
-            "intent": state["intent"],
-            "allowed_tools": allowed_tools,
-            "stopping_condition": _stopping_condition(state["user_prompt"], state["intent"]),
-        }
+        plan = _create_plan(state["user_prompt"], state["intent"])
         return {
             "plan": plan,
             "events": _append_event(state, "plan_created", **plan),
         }
 
     async def model_step(state: CodingAgentState) -> JsonObject:
+        available_tools = _tools_for_state(tools, state)
         response = _coerce_text_tool_call(
-            await model_client.complete(state["messages"], tools),
-            tool_names,
+            await model_client.complete(
+                _messages_for_executor_node(state),
+                available_tools,
+            ),
+            _tool_names_from_openai_tools(available_tools),
         )
         assistant_message = _assistant_message(response)
         pending_tool_calls = [
@@ -215,8 +213,29 @@ def _build_graph(
                 blocked_messages.append(_tool_message(call_id, name, f"Error: {reason}"))
                 continue
 
-            if not _is_tool_allowed(name, state["intent"]):
-                reason = f'{name} is not allowed for {state["intent"]} intent'
+            policy_violation = _tool_policy_violation(name, arguments, state)
+            if policy_violation is not None:
+                recovery_hint = _policy_recovery_hint(name, arguments, state)
+                tool_message = f"Policy blocked: {policy_violation}"
+                if recovery_hint:
+                    tool_message += f" {recovery_hint}"
+                events = _append_event_to_list(
+                    events,
+                    "tool_blocked",
+                    tool=name,
+                    arguments=arguments,
+                    reason=policy_violation,
+                    recovery_hint=recovery_hint,
+                )
+                blocked_messages.append(_tool_message(call_id, name, tool_message))
+                if _blocked_event_count(events) >= 2:
+                    blocked_reason = f"Blocked unsafe tool use: {policy_violation}"
+                continue
+
+            max_tool_calls = _max_tool_calls_from_plan(state)
+            next_tool_count = _tool_execution_count(events) + len(allowed_tool_calls) + 1
+            if next_tool_count > max_tool_calls:
+                reason = f"Maximum tool calls ({max_tool_calls}) reached"
                 events = _append_event_to_list(
                     events,
                     "tool_blocked",
@@ -225,8 +244,7 @@ def _build_graph(
                     reason=reason,
                 )
                 blocked_messages.append(_tool_message(call_id, name, f"Policy blocked: {reason}"))
-                if _blocked_event_count(events) >= 2:
-                    blocked_reason = f"Blocked unsafe tool use: {reason}"
+                blocked_reason = reason
                 continue
 
             allowed_tool_calls.append({**tool_call, "parsed_arguments": arguments})
@@ -263,6 +281,14 @@ def _build_graph(
                 arguments=arguments,
                 result=result,
             )
+            if _is_successful_write_result(name, result):
+                events = _append_event_to_list(
+                    events,
+                    "write_completed",
+                    tool=name,
+                    file_path=arguments.get("file_path"),
+                    result=result,
+                )
 
         return {
             "messages": messages,
@@ -281,8 +307,16 @@ def _build_graph(
             route = "failure_response"
             reason = "blocked"
         elif final_answer is not None:
+            if not final_answer.strip():
+                fallback_answer = _fallback_final_answer(state)
+                if fallback_answer is not None:
+                    final_answer = fallback_answer
+                    reason = "fallback_tool_result"
+                else:
+                    reason = "model_final"
+            else:
+                reason = "model_final"
             route = "final_response"
-            reason = "model_final"
         elif _should_stop_after_file_read(state):
             final_answer = _last_successful_tool_result(state, "get_file_content")
             route = "final_response"
@@ -310,7 +344,18 @@ def _build_graph(
     async def final_response(state: CodingAgentState) -> JsonObject:
         content = state["final_answer"] or ""
         return {
-            "events": _append_event(state, "final_answer", content=content),
+            "events": _append_event(
+                state,
+                "final_answer",
+                content=content,
+                prompt=build_final_response_prompt(
+                    user_prompt=state["user_prompt"],
+                    intent=state["intent"],
+                    blocked_reason=state["blocked_reason"],
+                    tool_events=_events_of_type(state["events"], "tool_executed"),
+                    write_events=_events_of_type(state["events"], "write_completed"),
+                ),
+            ),
         }
 
     async def failure_response(state: CodingAgentState) -> JsonObject:
@@ -381,13 +426,34 @@ def classify_intent(user_prompt: str) -> Intent:
     prompt = user_prompt.lower()
     if _contains_word_any(prompt, ("install", "dependency", "package", "pip")) or _contains_any(prompt, ("uv add",)):
         return "dependency"
-    if _contains_word_any(prompt, ("write", "create", "save", "edit", "modify", "delete", "overwrite", "add", "append", "insert")):
+    if _contains_word_any(
+        prompt,
+        (
+            "write",
+            "create",
+            "save",
+            "edit",
+            "modify",
+            "delete",
+            "overwrite",
+            "add",
+            "append",
+            "insert",
+            "replace",
+            "change",
+            "update",
+            "remove",
+        ),
+    ):
         return "write"
     if _contains_word_any(prompt, ("run", "execute", "test", "pytest", "unittest")):
         return "run"
     if _contains_word_any(prompt, ("commit", "push", "branch", "status", "diff", "merge")):
         return "git"
-    if _contains_word_any(prompt, ("print", "show", "read", "cat", "display", "list", "summarize")):
+    if _contains_word_any(
+        prompt,
+        ("print", "show", "read", "cat", "display", "list", "summarize", "find", "search", "grep"),
+    ):
         return "read_only"
     return "unknown"
 
@@ -405,6 +471,74 @@ def mcp_tool_to_openai_tool(tool: JsonObject) -> JsonObject:
             "description": tool.get("description") or "",
             "parameters": input_schema,
         },
+    }
+
+
+def _messages_for_executor_node(state: CodingAgentState) -> list[JsonObject]:
+    messages = [dict(message) for message in state["messages"]]
+    if not messages:
+        return messages
+
+    first_message = dict(messages[0])
+    first_message["content"] = (
+        str(first_message.get("content", "")).rstrip()
+        + "\n\n"
+        + _executor_node_prompt(state)
+        + _repair_prompt_suffix(state)
+    )
+    messages[0] = first_message
+    return messages
+
+
+def _executor_node_prompt(state: CodingAgentState) -> str:
+    plan = state.get("plan") if isinstance(state.get("plan"), dict) else {}
+    return build_executor_node_prompt(
+        intent=state["intent"],
+        risk_level=state["risk_level"],
+        allowed_tools=_plan_list(state, "allowed_tools"),
+        forbidden_tools=_plan_list(state, "forbidden_tools"),
+        preferred_tools=_plan_list(state, "preferred_tools"),
+        expected_write_paths=_plan_list(state, "expected_write_paths"),
+        tool_calls_used=_tool_execution_count(state["events"]),
+        max_tool_calls=_max_tool_calls_from_plan(state),
+        completion_signal=str(plan.get("completion_signal", "answer the user")),
+    )
+
+
+def _repair_prompt_suffix(state: CodingAgentState) -> str:
+    prompt = build_repair_node_prompt(_events_of_type(state["events"], "tool_blocked"))
+    if not prompt:
+        return ""
+    return "\n\n" + prompt
+
+
+def _tools_for_state(tools: list[JsonObject], state: CodingAgentState) -> list[JsonObject]:
+    if _tool_execution_count(state["events"]) >= _max_tool_calls_from_plan(state):
+        return []
+
+    allowed = set(_plan_list(state, "allowed_tools"))
+    forbidden = set(_plan_list(state, "forbidden_tools"))
+    available_names = allowed - forbidden
+    if not available_names:
+        return []
+
+    filtered_tools: list[JsonObject] = []
+    for tool in tools:
+        function = tool.get("function")
+        if not isinstance(function, dict):
+            continue
+        name = function.get("name")
+        if isinstance(name, str) and name in available_names:
+            filtered_tools.append(tool)
+    return filtered_tools
+
+
+def _tool_names_from_openai_tools(tools: list[JsonObject]) -> set[str]:
+    return {
+        tool["function"]["name"]
+        for tool in tools
+        if isinstance(tool.get("function"), dict)
+        and isinstance(tool["function"].get("name"), str)
     }
 
 
@@ -539,17 +673,157 @@ def _parse_tool_arguments(raw_arguments: str) -> tuple[JsonObject, str | None]:
     return arguments, None
 
 
+def _create_plan(user_prompt: str, intent: Intent) -> JsonObject:
+    expected_write_paths = _expected_write_paths(user_prompt, intent)
+    preferred_tools = _preferred_tools_for_prompt(user_prompt, intent)
+    return {
+        "goal": user_prompt,
+        "intent": intent,
+        "allowed_tools": sorted(_allowed_tools_for_intent(intent)),
+        "forbidden_tools": sorted(_forbidden_tools_for_intent(intent, user_prompt)),
+        "preferred_tools": preferred_tools,
+        "requires_confirmation": False,
+        "expected_write_paths": expected_write_paths,
+        "max_tool_calls": _max_tool_calls_for_intent(intent),
+        "completion_signal": _completion_signal(user_prompt, intent),
+        "stopping_condition": _stopping_condition(user_prompt, intent),
+    }
+
+
 def _allowed_tools_for_intent(intent: Intent) -> set[str]:
-    allowed = {"get_files_info", "get_file_content"}
+    allowed = set(READ_TOOLS)
     if intent == "write":
-        allowed.add("write_file")
+        allowed.update(WRITE_TOOLS)
     if intent == "run":
-        allowed.add("run_python_file")
+        allowed.update(RUN_TOOLS)
     return allowed
 
 
-def _is_tool_allowed(name: str, intent: Intent) -> bool:
-    return name in _allowed_tools_for_intent(intent)
+def _forbidden_tools_for_intent(intent: Intent, user_prompt: str) -> set[str]:
+    forbidden: set[str] = set()
+    if intent != "write":
+        forbidden.update(WRITE_TOOLS)
+    if intent != "run":
+        forbidden.update(RUN_TOOLS)
+    if intent == "write" and _preferred_write_tool(user_prompt) in {"append_file", "replace_in_file"}:
+        forbidden.add("write_file")
+    return forbidden
+
+
+def _preferred_tools_for_prompt(user_prompt: str, intent: Intent) -> list[str]:
+    if intent == "write":
+        preferred_write_tool = _preferred_write_tool(user_prompt)
+        if _is_vague_file_request(user_prompt):
+            return ["search_files", "get_files_info", preferred_write_tool]
+        return [preferred_write_tool]
+    if intent == "run":
+        return ["get_files_info", "get_file_content", "run_python_file"]
+    if intent == "read_only":
+        if _contains_word_any(user_prompt.lower(), ("search", "find")):
+            return ["search_files", "get_files_info"]
+        if _contains_word_any(user_prompt.lower(), ("grep",)):
+            return ["grep_files"]
+        return ["get_file_content", "get_files_info"]
+    return sorted(_allowed_tools_for_intent(intent))
+
+
+def _preferred_write_tool(user_prompt: str) -> str:
+    prompt = user_prompt.lower()
+    if _contains_word_any(prompt, ("add", "append", "insert")):
+        return "append_file"
+    if _contains_word_any(prompt, ("replace", "change", "substitute", "modify", "edit", "remove")):
+        return "replace_in_file"
+    return "write_file"
+
+
+def _max_tool_calls_for_intent(intent: Intent) -> int:
+    if intent == "read_only":
+        return 4
+    if intent == "write":
+        return 6
+    if intent == "run":
+        return 5
+    return 3
+
+
+def _completion_signal(user_prompt: str, intent: Intent) -> str:
+    if intent == "write":
+        return "target file was edited successfully or a policy/tool error explains why not"
+    if intent == "run":
+        return "command output or execution error has been returned"
+    if intent == "read_only" and _is_direct_file_content_request(user_prompt):
+        return "requested file content has been read"
+    return "the user request can be answered from gathered evidence"
+
+
+def _tool_policy_violation(
+    name: str,
+    arguments: JsonObject,
+    state: CodingAgentState,
+) -> str | None:
+    intent = state["intent"]
+    if name not in _allowed_tools_for_intent(intent):
+        return f"{name} is not allowed for {intent} intent"
+
+    if intent == "write" and name == "write_file":
+        preferred_write_tool = _preferred_write_tool(state["user_prompt"])
+        if preferred_write_tool in {"append_file", "replace_in_file"}:
+            return (
+                f"write_file is too broad for this request; use "
+                f"{preferred_write_tool} instead"
+            )
+
+    if name in WRITE_TOOLS:
+        expected_paths = _plan_list(state, "expected_write_paths")
+        requested_path = arguments.get("file_path")
+        if (
+            expected_paths
+            and isinstance(requested_path, str)
+            and requested_path not in expected_paths
+        ):
+            expected = ", ".join(expected_paths)
+            return f'{name} targets "{requested_path}", but the plan only allows: {expected}'
+
+    return None
+
+
+def _policy_recovery_hint(
+    name: str,
+    arguments: JsonObject,
+    state: CodingAgentState,
+) -> str:
+    if state["intent"] == "write" and name == "write_file":
+        preferred_write_tool = _preferred_write_tool(state["user_prompt"])
+        if preferred_write_tool in {"append_file", "replace_in_file"}:
+            return (
+                f"Use {preferred_write_tool} with the same file_path and content "
+                "when possible."
+            )
+
+    if name in WRITE_TOOLS:
+        expected_paths = _plan_list(state, "expected_write_paths")
+        requested_path = arguments.get("file_path")
+        if expected_paths and isinstance(requested_path, str):
+            return f"Use one of these file_path values: {', '.join(expected_paths)}."
+
+    return ""
+
+
+def _max_tool_calls_from_plan(state: CodingAgentState) -> int:
+    plan = state.get("plan")
+    if isinstance(plan, dict):
+        value = plan.get("max_tool_calls")
+        if isinstance(value, int) and value >= 0:
+            return value
+    return _max_tool_calls_for_intent(state["intent"])
+
+
+def _tool_execution_count(events: list[JsonObject]) -> int:
+    return sum(1 for event in events if event.get("type") == "tool_executed")
+
+
+def _is_successful_write_result(name: str, result: str) -> bool:
+    return name in WRITE_TOOLS and result.startswith("Successfully")
 
 
 def _risk_for_intent(intent: Intent) -> RiskLevel:
@@ -564,6 +838,50 @@ def _stopping_condition(user_prompt: str, intent: Intent) -> str:
     if intent == "read_only" and _is_direct_file_content_request(user_prompt):
         return "stop after successful file read"
     return "stop when the model has enough evidence for a final answer"
+
+
+def _expected_write_paths(user_prompt: str, intent: Intent) -> list[str]:
+    if intent != "write" or _is_vague_file_request(user_prompt):
+        return []
+    return _extract_file_paths(user_prompt)
+
+
+def _extract_file_paths(user_prompt: str) -> list[str]:
+    candidates = re.findall(
+        r"(?<![\w./-])[\w./-]+\.[A-Za-z0-9][A-Za-z0-9_-]*(?![\w./-])",
+        user_prompt,
+    )
+    paths: list[str] = []
+    for candidate in candidates:
+        cleaned = candidate.strip("'\"`.,:;()[]{}")
+        if cleaned and cleaned not in paths:
+            paths.append(cleaned)
+    return paths
+
+
+def _is_vague_file_request(user_prompt: str) -> bool:
+    prompt = user_prompt.lower()
+    return _contains_any(
+        prompt,
+        (
+            "whatever file",
+            "whatever text file",
+            "any file",
+            "any text file",
+            "file there is",
+            "text file there is",
+        ),
+    )
+
+
+def _plan_list(state: CodingAgentState, key: str) -> list[str]:
+    plan = state.get("plan")
+    if not isinstance(plan, dict):
+        return []
+    values = plan.get(key)
+    if not isinstance(values, list):
+        return []
+    return [value for value in values if isinstance(value, str)]
 
 
 def _should_stop_after_file_read(state: CodingAgentState) -> bool:
@@ -590,8 +908,28 @@ def _last_successful_tool_result(state: CodingAgentState, tool_name: str) -> str
     return None
 
 
+def _fallback_final_answer(state: CodingAgentState) -> str | None:
+    for event in reversed(state["events"]):
+        if event.get("type") == "write_completed":
+            result = event.get("result")
+            if isinstance(result, str) and result:
+                return f"Completed: {result}"
+
+    for event in reversed(state["events"]):
+        if event.get("type") == "tool_executed":
+            result = event.get("result")
+            if isinstance(result, str) and result:
+                return result
+
+    return None
+
+
 def _blocked_event_count(events: list[JsonObject]) -> int:
     return sum(1 for event in events if event.get("type") == "tool_blocked")
+
+
+def _events_of_type(events: list[JsonObject], event_type: str) -> list[JsonObject]:
+    return [event for event in events if event.get("type") == event_type]
 
 
 def _append_event(state: CodingAgentState, event_type: str, **payload: Any) -> list[JsonObject]:
@@ -625,7 +963,10 @@ def _format_event(event: JsonObject) -> str:
     if event_type == "intent_classified":
         return f"intent_classified intent={event.get('intent')} risk={event.get('risk_level')}"
     if event_type == "plan_created":
-        return f"plan_created allowed_tools={event.get('allowed_tools')}"
+        return (
+            f"plan_created allowed_tools={event.get('allowed_tools')} "
+            f"preferred_tools={event.get('preferred_tools')}"
+        )
     if event_type == "model_responded":
         content = _single_line(str(event.get("content") or ""), limit=160)
         tool_calls = event.get("tool_calls") or []
@@ -637,6 +978,9 @@ def _format_event(event: JsonObject) -> str:
     if event_type == "tool_executed":
         result = _single_line(str(event.get("result", "")), limit=240)
         return f"tool_executed {event.get('tool')}({_format_json(event.get('arguments'))}) -> {result}"
+    if event_type == "write_completed":
+        result = _single_line(str(event.get("result", "")), limit=160)
+        return f"write_completed {event.get('tool')} file_path={event.get('file_path')} -> {result}"
     if event_type == "review_completed":
         return f"review_completed route={event.get('route')} reason={event.get('reason')}"
     if event_type == "final_answer":

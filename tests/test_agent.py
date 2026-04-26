@@ -8,6 +8,7 @@ from coding_agent.agent import format_agent_trace, mcp_tool_to_openai_tool, run_
 from coding_agent.config import load_settings
 from coding_agent.workflow import AgentResult, classify_intent
 from coding_agent.model_client import ModelResponse, ModelToolCall
+from prompts import build_final_response_prompt
 
 try:
     import langgraph  # noqa: F401
@@ -53,6 +54,51 @@ class FakeToolClient:
                 },
             },
             {
+                "name": "search_files",
+                "description": "Search file names",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {"type": "string"},
+                        "directory": {"type": "string"},
+                    },
+                },
+            },
+            {
+                "name": "grep_files",
+                "description": "Search file contents",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {"type": "string"},
+                        "directory": {"type": "string"},
+                    },
+                },
+            },
+            {
+                "name": "append_file",
+                "description": "Append to a file",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string"},
+                        "content": {"type": "string"},
+                    },
+                },
+            },
+            {
+                "name": "replace_in_file",
+                "description": "Replace exact text in a file",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string"},
+                        "old_text": {"type": "string"},
+                        "new_text": {"type": "string"},
+                    },
+                },
+            },
+            {
                 "name": "write_file",
                 "description": "Write a file",
                 "inputSchema": {
@@ -81,6 +127,12 @@ class FakeToolClient:
 
     async def call_tool(self, name, arguments):
         self.calls.append((name, arguments))
+        if name == "append_file":
+            return f'Successfully appended to "{arguments.get("file_path")}"'
+        if name == "replace_in_file":
+            return f'Successfully replaced 1 occurrence(s) in "{arguments.get("file_path")}"'
+        if name == "write_file":
+            return f'Successfully wrote to "{arguments.get("file_path")}"'
         return f"{name} result"
 
 
@@ -461,7 +513,7 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
             [("write_file", {"file_path": "content.txt", "content": "new_text"})],
         )
 
-    async def test_explicit_add_prompt_allows_write_file(self):
+    async def test_explicit_add_prompt_allows_append_file(self):
         model = FakeModelClient(
             [
                 ModelResponse(
@@ -469,7 +521,7 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
                     (
                         ModelToolCall(
                             id="call_1",
-                            name="write_file",
+                            name="append_file",
                             arguments='{"file_path": "lorem.txt", "content": "new_text"}',
                         ),
                     ),
@@ -490,8 +542,191 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.tool_call_count, 1)
         self.assertEqual(
             tools.calls,
-            [("write_file", {"file_path": "lorem.txt", "content": "new_text"})],
+            [("append_file", {"file_path": "lorem.txt", "content": "new_text"})],
         )
+        event_types = [event["type"] for event in result.events]
+        self.assertIn("write_completed", event_types)
+        sent_tool_names = _sent_tool_names(model.calls[0])
+        self.assertIn("append_file", sent_tool_names)
+        self.assertNotIn("write_file", sent_tool_names)
+        self.assertIn(
+            "Executor node instructions",
+            model.calls[0]["messages"][0]["content"],
+        )
+        self.assertIn("Preferred tools: append_file", model.calls[0]["messages"][0]["content"])
+
+    async def test_add_prompt_blocks_broad_write_then_allows_append(self):
+        model = FakeModelClient(
+            [
+                ModelResponse(
+                    None,
+                    (
+                        ModelToolCall(
+                            id="call_1",
+                            name="write_file",
+                            arguments='{"file_path": "lorem.txt", "content": "new_text"}',
+                        ),
+                    ),
+                ),
+                ModelResponse(
+                    None,
+                    (
+                        ModelToolCall(
+                            id="call_2",
+                            name="append_file",
+                            arguments='{"file_path": "lorem.txt", "content": "new_text"}',
+                        ),
+                    ),
+                ),
+                ModelResponse("added it safely"),
+            ]
+        )
+        tools = FakeToolClient()
+
+        result = await run_agent(
+            "add new_text to lorem.txt",
+            settings=_settings(),
+            model_client=model,
+            tool_client=tools,
+        )
+
+        self.assertEqual(result.content, "added it safely")
+        self.assertEqual(
+            tools.calls,
+            [("append_file", {"file_path": "lorem.txt", "content": "new_text"})],
+        )
+        blocked_events = [
+            event for event in result.events if event["type"] == "tool_blocked"
+        ]
+        self.assertEqual(blocked_events[0]["tool"], "write_file")
+        self.assertIn("append_file", blocked_events[0]["reason"])
+        self.assertIn("Use append_file", model.calls[1]["messages"][-1]["content"])
+        self.assertIn("Repair node instructions", model.calls[1]["messages"][0]["content"])
+
+    async def test_explicit_replace_prompt_prefers_replace_in_file(self):
+        model = FakeModelClient(
+            [
+                ModelResponse(
+                    None,
+                    (
+                        ModelToolCall(
+                            id="call_1",
+                            name="replace_in_file",
+                            arguments=(
+                                '{"file_path": "lorem.txt", "old_text": "old", '
+                                '"new_text": "new"}'
+                            ),
+                        ),
+                    ),
+                ),
+                ModelResponse("replaced it"),
+            ]
+        )
+        tools = FakeToolClient()
+
+        result = await run_agent(
+            "replace old with new in lorem.txt",
+            settings=_settings(),
+            model_client=model,
+            tool_client=tools,
+        )
+
+        self.assertEqual(result.content, "replaced it")
+        self.assertEqual(
+            tools.calls,
+            [
+                (
+                    "replace_in_file",
+                    {"file_path": "lorem.txt", "old_text": "old", "new_text": "new"},
+                )
+            ],
+        )
+        sent_tool_names = _sent_tool_names(model.calls[0])
+        self.assertIn("replace_in_file", sent_tool_names)
+        self.assertNotIn("write_file", sent_tool_names)
+        self.assertIn(
+            "Preferred tools: replace_in_file",
+            model.calls[0]["messages"][0]["content"],
+        )
+
+    async def test_replace_prompt_blocks_unplanned_write_path(self):
+        model = FakeModelClient(
+            [
+                ModelResponse(
+                    None,
+                    (
+                        ModelToolCall(
+                            id="call_1",
+                            name="replace_in_file",
+                            arguments=(
+                                '{"file_path": "other.txt", "old_text": "old", '
+                                '"new_text": "new"}'
+                            ),
+                        ),
+                    ),
+                ),
+                ModelResponse("I will not edit the wrong file."),
+            ]
+        )
+        tools = FakeToolClient()
+
+        result = await run_agent(
+            "replace old with new in expected.txt",
+            settings=_settings(),
+            model_client=model,
+            tool_client=tools,
+        )
+
+        self.assertEqual(result.content, "I will not edit the wrong file.")
+        self.assertEqual(tools.calls, [])
+        blocked_events = [
+            event for event in result.events if event["type"] == "tool_blocked"
+        ]
+        self.assertIn("plan only allows", blocked_events[0]["reason"])
+
+    async def test_read_only_prompt_allows_search_and_grep_tools(self):
+        model = FakeModelClient(
+            [
+                ModelResponse(
+                    None,
+                    (
+                        ModelToolCall(
+                            id="call_1",
+                            name="search_files",
+                            arguments='{"pattern": "agent"}',
+                        ),
+                        ModelToolCall(
+                            id="call_2",
+                            name="grep_files",
+                            arguments='{"pattern": "TODO", "directory": "."}',
+                        ),
+                    ),
+                ),
+                ModelResponse("searched"),
+            ]
+        )
+        tools = FakeToolClient()
+
+        result = await run_agent(
+            "search files for agent and grep TODO",
+            settings=_settings(),
+            model_client=model,
+            tool_client=tools,
+        )
+
+        self.assertEqual(result.content, "searched")
+        self.assertEqual(
+            tools.calls,
+            [
+                ("search_files", {"pattern": "agent"}),
+                ("grep_files", {"pattern": "TODO", "directory": "."}),
+            ],
+        )
+        sent_tool_names = _sent_tool_names(model.calls[0])
+        self.assertIn("search_files", sent_tool_names)
+        self.assertIn("grep_files", sent_tool_names)
+        self.assertNotIn("append_file", sent_tool_names)
+        self.assertNotIn("write_file", sent_tool_names)
 
     async def test_explicit_run_prompt_allows_run_python_file(self):
         model = FakeModelClient(
@@ -520,6 +755,64 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.content, "ran it")
         self.assertEqual(tools.calls, [("run_python_file", {"file_path": "main.py"})])
+
+    async def test_empty_final_after_tool_uses_latest_tool_result(self):
+        model = FakeModelClient(
+            [
+                ModelResponse(
+                    None,
+                    (
+                        ModelToolCall(
+                            id="call_1",
+                            name="run_python_file",
+                            arguments='{"file_path": "main.py"}',
+                        ),
+                    ),
+                ),
+                ModelResponse(""),
+            ]
+        )
+        tools = FakeToolClient()
+
+        result = await run_agent(
+            "run main.py",
+            settings=_settings(),
+            model_client=model,
+            tool_client=tools,
+        )
+
+        self.assertEqual(result.content, "run_python_file result")
+        review_events = [
+            event for event in result.events if event["type"] == "review_completed"
+        ]
+        self.assertEqual(review_events[-1]["reason"], "fallback_tool_result")
+
+    async def test_empty_final_after_write_uses_write_completion(self):
+        model = FakeModelClient(
+            [
+                ModelResponse(
+                    None,
+                    (
+                        ModelToolCall(
+                            id="call_1",
+                            name="append_file",
+                            arguments='{"file_path": "notes.txt", "content": "hello"}',
+                        ),
+                    ),
+                ),
+                ModelResponse(""),
+            ]
+        )
+        tools = FakeToolClient()
+
+        result = await run_agent(
+            "add hello to notes.txt",
+            settings=_settings(),
+            model_client=model,
+            tool_client=tools,
+        )
+
+        self.assertEqual(result.content, 'Completed: Successfully appended to "notes.txt"')
 
     async def test_repeated_unsafe_tool_proposal_stops_blocked(self):
         model = FakeModelClient(
@@ -558,6 +851,44 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tools.calls, [])
         self.assertIsNotNone(result.blocked_reason)
         self.assertIn("Blocked unsafe tool use", result.content)
+
+    async def test_max_tool_calls_stops_runaway_tool_use(self):
+        model = FakeModelClient(
+            [
+                ModelResponse(
+                    None,
+                    (
+                        ModelToolCall(
+                            id=f"call_{index}",
+                            name="search_files",
+                            arguments='{"pattern": "agent"}',
+                        ),
+                    ),
+                )
+                for index in range(1, 6)
+            ]
+        )
+        tools = FakeToolClient()
+
+        result = await run_agent(
+            "search files for agent",
+            settings=_settings(),
+            model_client=model,
+            tool_client=tools,
+        )
+
+        self.assertEqual(
+            tools.calls,
+            [
+                ("search_files", {"pattern": "agent"}),
+                ("search_files", {"pattern": "agent"}),
+                ("search_files", {"pattern": "agent"}),
+                ("search_files", {"pattern": "agent"}),
+            ],
+        )
+        self.assertIn("Maximum tool calls (4) reached", result.content)
+        self.assertIn("Maximum tool calls (4) reached", result.blocked_reason)
+        self.assertEqual(model.calls[-1]["tools"], [])
 
     async def test_tool_error_is_recorded_and_routed_back_to_model(self):
         model = FakeModelClient(
@@ -649,10 +980,43 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    def test_final_response_prompt_summarizes_terminal_context(self):
+        prompt = build_final_response_prompt(
+            user_prompt="add hello to notes.txt",
+            intent="write",
+            blocked_reason=None,
+            tool_events=[
+                {
+                    "type": "tool_executed",
+                    "tool": "append_file",
+                    "result": 'Successfully appended to "notes.txt"',
+                }
+            ],
+            write_events=[
+                {
+                    "type": "write_completed",
+                    "tool": "append_file",
+                    "file_path": "notes.txt",
+                }
+            ],
+        )
+
+        self.assertIn("Final response node instructions", prompt)
+        self.assertIn("Do not request or imply any additional tool calls", prompt)
+        self.assertIn("Observed tool results: 1", prompt)
+        self.assertIn("Observed successful writes: 1", prompt)
+
 
 def _settings():
     with patch.dict(os.environ, {}, clear=True):
         return load_settings()
+
+
+def _sent_tool_names(model_call):
+    return {
+        tool["function"]["name"]
+        for tool in model_call["tools"]
+    }
 
 
 if __name__ == "__main__":

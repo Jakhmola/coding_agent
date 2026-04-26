@@ -1,9 +1,9 @@
 """Default values shared across the coding agent services."""
 
-DEFAULT_MODEL_NAME = "coding-qwen-gpu"
+DEFAULT_MODEL_NAME = "opus-ghost-codex-4b-q5"
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
-DEFAULT_OPENAI_BASE_URL = "http://localhost:11434/v1"
-DEFAULT_OPENAI_API_KEY = "ollama"
+DEFAULT_OPENAI_BASE_URL = "http://localhost:8080/v1"
+DEFAULT_OPENAI_API_KEY = "llama.cpp"
 
 DEFAULT_WORKSPACE_DIR = "./calculator"
 DEFAULT_WORKSPACE_READ_ONLY = False
@@ -27,4 +27,3 @@ DEFAULT_LOG_JSON = True
 DEFAULT_OPIK_ENABLED = False
 DEFAULT_OPIK_PROJECT_NAME = "coding-agent"
 DEFAULT_OPIK_URL = "http://localhost:5173"
-

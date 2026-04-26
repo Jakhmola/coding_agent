@@ -1,23 +1,30 @@
 services:
-  ollama:
-    image: ollama/ollama:latest
-    container_name: coding-agent-ollama
+  llama-cpp:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    container_name: coding-agent-llama-cpp
     ports:
-      - "11434:11434"
+      - "8080:8080"
     volumes:
-      - ollama-data:/root/.ollama
-      - ./models:/models:ro
+      - llama-cache:/root/.cache
     environment:
-      OLLAMA_HOST: 0.0.0.0:11434
-      OLLAMA_KEEP_ALIVE: "-1"
-      OLLAMA_NUM_PARALLEL: "1"
-      OLLAMA_MAX_LOADED_MODELS: "1"
-      OLLAMA_LLM_LIBRARY: cuda_v13
-      OLLAMA_FLASH_ATTENTION: "1"
-      OLLAMA_KV_CACHE_TYPE: q8_0
-      OLLAMA_SCHED_SPREAD: "false"
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    command:
+      - --hf-repo
+      - WithinUsAI/Opus4.7-GODs.Ghost.Codex-4B.GGuF
+      - --hf-file
+      - Opus4.7-Distill-GODsGhost-Codex-4B-Q5_K_M.gguf
+      - --alias
+      - opus-ghost-codex-4b-q5
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --ctx-size
+      - "${LLAMA_CTX_SIZE:-4096}"
+      - --n-gpu-layers
+      - all
+      - --jinja
     deploy:
       resources:
         reservations:
@@ -25,29 +32,6 @@ services:
             - driver: nvidia
               count: all
               capabilities: ["gpu"]
-    healthcheck:
-      test: ["CMD", "ollama", "list"]
-      interval: 10s
-      timeout: 5s
-      retries: 30
-      start_period: 20s
-
-  ollama-init:
-    image: ollama/ollama:latest
-    depends_on:
-      ollama:
-        condition: service_healthy
-    environment:
-      OLLAMA_HOST: http://ollama:11434
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-coding-qwen-gpu}
-      OLLAMA_BASE_MODEL: ${OLLAMA_BASE_MODEL:-qwen2.5-coder:7b-instruct-q4_0}
-    volumes:
-      - ollama-data:/root/.ollama
-      - ./models:/models:ro
-    entrypoint: ["/bin/sh", "-lc"]
-    command:
-      - 'ollama pull "$${OLLAMA_BASE_MODEL}" && ollama create "$${OLLAMA_MODEL}" -f /models/Modelfile'
-    restart: "no"
 
 volumes:
-  ollama-data:
+  llama-cache:

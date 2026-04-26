@@ -4,18 +4,18 @@ This is the living implementation plan for the coding agent upgrade. Keep the ch
 
 ## Target Architecture
 
-- `ollama`: local OpenAI-compatible model endpoint on GPU.
+- `llama.cpp`: local OpenAI-compatible model endpoint on GPU.
 - `mcp-server`: Streamable HTTP MCP server exposing prompts and current coding tools.
 - `a2a-agent`: A2A HTTP agent backed by the MCP client and local model.
 - `cli`: one-shot command wrapper that talks to the running A2A agent.
 - `opik`: optional tracing for CLI requests, A2A tasks, model calls, and MCP tool calls.
 
-Default model: `qwen2.5-coder:7b-instruct-q4_0`, wrapped as `coding-qwen-gpu`.
+Default model: `WithinUsAI/Opus4.7-GODs.Ghost.Codex-4B.GGuF`, using `Opus4.7-Distill-GODsGhost-Codex-4B-Q5_K_M.gguf` and served as `opus-ghost-codex-4b-q5`.
 
 ## Key Decisions
 
-- Use Ollama instead of vLLM for v1 because it is simpler, OpenAI-compatible, Docker-friendly, and practical for Q4 models on a 6GB NVIDIA GPU.
-- Require the model to run fully on GPU. If `num_ctx 4096` spills to CPU, reduce once to `2048`; if it still spills, fail loudly and do not change model automatically.
+- Use llama.cpp for v1 because it can serve GGUF models directly, remains OpenAI-compatible, is Docker-friendly, and gives explicit control over CUDA offload.
+- Require the model to run with `--n-gpu-layers all`. If `ctx-size 4096` fails to start or fails the smoke checks, reduce once to `2048`; if it still fails, fail loudly and do not fall back silently.
 - Keep v1 tools limited to the current core set: list files, read file, write file, run Python file.
 - Defer extra tools and multi-agent roles until after v1 is stable.
 - Keep current direct Gemini path only as temporary compatibility until the OpenAI-compatible agent loop replaces it.
@@ -26,7 +26,7 @@ Default model: `qwen2.5-coder:7b-instruct-q4_0`, wrapped as `coding-qwen-gpu`.
 - [x] Slice 1: Config, constants, structured logging foundation, workspace policy config, `.env.example`.
 - [x] Slice 2: Harden current tools with workspace policy and focused tests.
 - [x] Slice 3: MCP server exposing current tools and system prompt.
-- [x] Slice 4: Ollama Docker service, Modelfile, model pull/check workflow.
+- [x] Slice 4: llama.cpp Docker service and model check workflow.
 - [x] Slice 5: OpenAI-compatible MCP-backed agent loop with mocked model tests.
 - [ ] Slice 6: A2A HTTP wrapper and CLI commands.
 - [ ] Slice 7: Opik tracing hooks with clean disabled mode.
@@ -49,20 +49,20 @@ Status: complete in `coding_agent/mcp_server.py`. Smoke command:
 
 ## Slice 4 Acceptance Criteria
 
-- Add an Ollama Docker Compose service with NVIDIA GPU access and persistent model storage.
-- Add Modelfiles for `coding-qwen-gpu` using `qwen2.5-coder:7b-instruct-q4_0` at `num_ctx 4096`, plus one reduced-context `2048` fallback.
-- Add Make targets for starting Ollama, pulling/creating the model, validating Compose config, and checking the model is loaded `100% GPU`.
-- Enforce the strict fallback rule: if default context is not `100% GPU`, recreate once with reduced context; if still not `100% GPU`, fail loudly.
-- Do not pull the model automatically during normal tests.
+- Add a llama.cpp Docker Compose service with NVIDIA GPU access and persistent Hugging Face cache storage.
+- Serve `WithinUsAI/Opus4.7-GODs.Ghost.Codex-4B.GGuF` with Q5_K_M quant, `ctx-size 4096`, `--n-gpu-layers all`, and `--jinja`.
+- Add Make targets for starting llama.cpp, stopping it, validating Compose config, and checking the OpenAI-compatible model server.
+- Enforce the strict fallback rule: if default context fails server/API smoke checks, recreate once with `ctx-size 2048`; if still failing, fail loudly.
+- Do not download or start the model during normal unit tests.
 
-Status: complete in `docker-compose.yml`, `models/`, `Makefile`, and `scripts/model_check.py`.
+Status: complete in `docker-compose.yml`, `Makefile`, and `scripts/model_check.py`.
 
 ## Slice 5 Acceptance Criteria
 
-- Add an OpenAI-compatible chat completions client for Ollama without requiring model calls in unit tests.
+- Add an OpenAI-compatible chat completions client for the local model server without requiring model calls in unit tests.
 - Add an MCP client adapter that can list tools, read the coding-agent system prompt, and call MCP tools over Streamable HTTP.
 - Add an agent loop that converts MCP tool schemas to OpenAI tool definitions, handles model tool calls, sends tool results back to the model, and stops on final assistant content.
-- Handle Qwen/Ollama's local text-form tool requests when it returns a JSON-like `{name, arguments}` payload instead of native OpenAI `tool_calls`.
+- Handle local model text-form tool requests when it returns a JSON-like `{name, arguments}` payload instead of native OpenAI `tool_calls`.
 - Cover the loop with mocked model and MCP clients, including direct answers, tool use, multiple tool calls, malformed tool arguments, and max-iteration failure.
 - Keep the old direct Gemini CLI path intact until the later cleanup slice.
 
@@ -74,7 +74,7 @@ Status: complete in `coding_agent/model_client.py`, `coding_agent/mcp_client.py`
 
 Use `--verbose` to print a sequential agent trace: user input, each model turn, what was sent to the model, model responses, tool names and arguments, tool results, and the final answer.
 
-Local smoke validation passed with `coding-qwen-gpu` loaded `100% GPU`:
+Local smoke validation path:
 
 ```bash
 make model-check
@@ -87,15 +87,16 @@ make model-check
 
 - Unit tests should avoid paid or remote model calls.
 - Use mocked model responses for future agent-loop tests.
-- Use MCP server/client smoke tests without involving Ollama.
-- Keep one local model smoke test for the later Ollama slice, only after GPU verification passes.
+- Use MCP server/client smoke tests without involving the model runtime.
+- Keep one local model smoke test only after llama.cpp server verification passes.
 
 ## Current Validation Commands
 
 ```bash
 python3 -m unittest discover -s tests -p 'test_*.py'
 python3 -m compileall -q coding_agent functions tests main.py call_function.py
-python3 main.py
+make llama-up
+make model-check
 ```
 
 ## Notes

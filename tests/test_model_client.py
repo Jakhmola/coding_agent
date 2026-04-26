@@ -52,11 +52,11 @@ class OpenAIChatClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response, ModelResponse("done"))
         self.assertEqual(
             calls[0]["url"],
-            "http://localhost:11434/v1/chat/completions",
+            "http://localhost:8080/v1/chat/completions",
         )
-        self.assertEqual(calls[0]["payload"]["model"], "coding-qwen-gpu")
+        self.assertEqual(calls[0]["payload"]["model"], "opus-ghost-codex-4b-q5")
         self.assertEqual(calls[0]["payload"]["tool_choice"], "auto")
-        self.assertEqual(calls[0]["headers"]["Authorization"], "Bearer ollama")
+        self.assertEqual(calls[0]["headers"]["Authorization"], "Bearer llama.cpp")
         self.assertEqual(calls[0]["timeout"], 5.0)
 
     async def test_omits_tool_choice_when_no_tools_are_available(self):

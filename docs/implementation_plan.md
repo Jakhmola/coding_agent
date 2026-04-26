@@ -1,4 +1,4 @@
-# MCP + A2A Coding Agent V1 Plan
+# MCP Coding Agent V1 Plan
 
 This is the living implementation plan for the coding agent upgrade. Keep the checklist updated as each slice lands so future work can resume without reconstructing context.
 
@@ -7,9 +7,9 @@ This is the living implementation plan for the coding agent upgrade. Keep the ch
 - `llama.cpp`: local OpenAI-compatible model endpoint on GPU.
 - `mcp-server`: Streamable HTTP MCP server exposing prompts and current coding tools.
 - `workflow`: LangGraph internal coding workflow backed by the MCP client and local model.
-- `a2a-agent`: future A2A HTTP wrapper around the internal workflow.
-- `cli`: one-shot command wrapper that talks to the running A2A agent.
-- `opik`: optional tracing for CLI requests, A2A tasks, model calls, and MCP tool calls.
+- `cli`: one-shot command wrapper that calls the internal workflow directly.
+- `opik`: optional tracing for workflow runs, model calls, policy decisions, and MCP tool calls.
+- `a2a-agent`: deferred future HTTP wrapper around the internal workflow.
 
 Default model: `WithinUsAI/Opus4.7-GODs.Ghost.Codex-4B.GGuF`, using `Opus4.7-Distill-GODsGhost-Codex-4B-Q5_K_M.gguf` and served as `opus-ghost-codex-4b-q5`.
 
@@ -19,7 +19,7 @@ Default model: `WithinUsAI/Opus4.7-GODs.Ghost.Codex-4B.GGuF`, using `Opus4.7-Dis
 - Require the model to run with `--n-gpu-layers all`. If `ctx-size 4096` fails to start or fails the smoke checks, reduce once to `2048`; if it still fails, fail loudly and do not fall back silently.
 - Keep tool growth policy-driven: read/search tools are broadly safe, precise edit tools are preferred before full-file writes, and command tools remain tightly gated.
 - Use a hybrid LangGraph state: explicit routing fields plus append-only events for trace/debug and future A2A streaming.
-- Defer A2A and multi-agent roles until the internal workflow policy is stable.
+- Defer A2A and multi-agent roles until the direct CLI/workflow path is stable.
 - Keep current direct Gemini path only as temporary compatibility until the OpenAI-compatible agent loop replaces it.
 - Protect local `.env`; only `.env.example` belongs in git.
 
@@ -32,10 +32,9 @@ Default model: `WithinUsAI/Opus4.7-GODs.Ghost.Codex-4B.GGuF`, using `Opus4.7-Dis
 - [x] Slice 5: OpenAI-compatible MCP-backed agent loop with mocked model tests.
 - [x] Slice 6: Hybrid LangGraph internal workflow and tool policy.
 - [x] Slice 7: Safer search/edit tools and node-specific executor prompting.
-- [ ] Slice 8: A2A HTTP wrapper and CLI commands.
-- [ ] Slice 9: Opik tracing hooks with clean disabled mode.
-- [ ] Slice 10: Docker Compose and Makefile workflow.
-- [ ] Slice 11: Remove obsolete direct-dispatch code and update README.
+- [x] Slice 8: Opik tracing hooks with clean disabled mode.
+- [ ] Slice 9: Docker Compose and Makefile workflow.
+- [ ] Slice 10: Remove obsolete direct-dispatch code and update README.
 
 ## Slice 3 Acceptance Criteria
 
@@ -119,6 +118,20 @@ Expected behavior: one `get_file_content` call, no `write_file`, and final answe
 
 Status: complete in `coding_agent/workflow.py`, `coding_agent/mcp_server.py`, `functions/`, `prompts.py`, and tests.
 
+## Slice 8 Acceptance Criteria
+
+- Add optional Opik tracing without changing workflow behavior when `OPIK_ENABLED=false`.
+- Keep the Opik SDK import lazy so disabled mode does not require credentials or an installed/configured Opik service.
+- Record one top-level workflow trace with request id, intent, final status, iteration count, tool count, and blocked reason.
+- Record spans for intake, intent classification, planning, model calls, policy checks, MCP tool execution, progress review, final response, and failure response.
+- Mark model spans as `llm`, tool spans as `tool`, and policy block spans as `guardrail`.
+- Sanitize trace payloads so full prompts, full files, full tool results, full message arrays, and secrets are not logged.
+- Preserve OpenAI-compatible token usage on `ModelResponse` for tracing when the server returns it.
+- Keep tracing at workflow orchestration boundaries so mocked tests and real clients share the same instrumentation.
+- Do not add A2A in this slice.
+
+Status: complete in `coding_agent/tracing.py`, `coding_agent/workflow.py`, and tests. Opik is enabled by setting `OPIK_ENABLED=true`; `OPIK_URL` is passed to the SDK as the client `host`.
+
 ## Test Strategy
 
 - Unit tests should avoid paid or remote model calls.
@@ -129,8 +142,9 @@ Status: complete in `coding_agent/workflow.py`, `coding_agent/mcp_server.py`, `f
 ## Current Validation Commands
 
 ```bash
-python3 -m unittest discover -s tests -p 'test_*.py'
-python3 -m compileall -q coding_agent functions tests main.py call_function.py scripts/model_check.py
+.venv/bin/python -m unittest discover -s tests -p 'test_*.py'
+.venv/bin/python -m compileall -q coding_agent functions tests main.py call_function.py scripts/model_check.py prompts.py
+.venv/bin/python -m coding_agent.mcp_server --list
 make compose-check
 make llama-up
 make model-check
@@ -138,5 +152,6 @@ make model-check
 
 ## Notes
 
-- Existing local changes to `calculator/lorem.txt`, `pyproject.toml`, and `uv.lock` are user-owned unless a later slice explicitly adopts them.
+- Existing local changes to `calculator/lorem.txt` are user-owned.
 - If dependencies need to change, prefer updating `pyproject.toml` intentionally in the slice that needs them and explain why.
+- A2A remains deferred future work; keep CLI direct-to-workflow for the V1 path until tracing and policy behavior are stable.

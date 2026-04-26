@@ -5,6 +5,7 @@ import logging
 
 from coding_agent.config import Settings, load_settings
 from coding_agent.logging import configure_logging
+from coding_agent.tracing import Tracer
 from coding_agent.workflow import (
     AgentResult,
     ModelClient,
@@ -21,12 +22,14 @@ async def run_agent(
     settings: Settings | None = None,
     model_client: ModelClient | None = None,
     tool_client: ToolClient | None = None,
+    tracer: Tracer | None = None,
 ) -> AgentResult:
     return await run_workflow(
         user_prompt,
         settings=settings,
         model_client=model_client,
         tool_client=tool_client,
+        tracer=tracer,
     )
 
 

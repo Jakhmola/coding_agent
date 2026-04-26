@@ -20,6 +20,7 @@ class ModelToolCall:
 class ModelResponse:
     content: str | None
     tool_calls: tuple[ModelToolCall, ...] = ()
+    usage: JsonObject | None = None
 
 
 class JsonPoster(Protocol):
@@ -137,4 +138,12 @@ def parse_chat_completion_response(response: JsonObject) -> ModelResponse:
             ModelToolCall(id=call_id, name=name, arguments=arguments)
         )
 
-    return ModelResponse(content=content, tool_calls=tuple(parsed_calls))
+    usage = response.get("usage")
+    if not isinstance(usage, dict):
+        usage = None
+
+    return ModelResponse(
+        content=content,
+        tool_calls=tuple(parsed_calls),
+        usage=usage,
+    )

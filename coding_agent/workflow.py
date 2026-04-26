@@ -9,6 +9,15 @@ from uuid import uuid4
 from coding_agent.config import Settings, load_settings
 from coding_agent.mcp_client import McpClient
 from coding_agent.model_client import ModelResponse, ModelToolCall, OpenAIChatClient
+from coding_agent.tracing import (
+    Tracer,
+    build_tracer,
+    sanitize_tool_arguments,
+    summarize_messages,
+    summarize_text,
+    summarize_tool_calls,
+    summarize_tools,
+)
 from prompts import (
     build_base_system_prompt,
     build_executor_node_prompt,
@@ -76,37 +85,74 @@ async def run_workflow(
     settings: Settings | None = None,
     model_client: ModelClient | None = None,
     tool_client: ToolClient | None = None,
+    tracer: Tracer | None = None,
 ) -> AgentResult:
     settings = settings or load_settings()
     model_client = model_client or OpenAIChatClient(settings)
     tool_client = tool_client or McpClient(settings)
+    tracer = tracer or build_tracer(settings.opik)
 
-    system_prompt = await tool_client.get_system_prompt()
-    tools = [
-        mcp_tool_to_openai_tool(tool)
-        for tool in await tool_client.list_tools()
-    ]
-    graph = _build_graph(
-        settings=settings,
-        model_client=model_client,
-        tool_client=tool_client,
-        system_prompt=system_prompt,
-        tools=tools,
-    )
-    final_state = await graph.ainvoke(_initial_state(user_prompt))
-    final_answer = final_state.get("final_answer") or final_state.get("blocked_reason")
-    if final_answer is None:
-        final_answer = "No final answer was produced."
+    request_id = str(uuid4())
+    with tracer.trace(
+        "coding_agent.workflow",
+        input={"user_prompt": summarize_text(user_prompt)},
+        metadata={
+            "request_id": request_id,
+            "model": settings.model_name,
+            "max_iterations": settings.max_iterations,
+            "workspace_read_only": settings.workspace_policy.read_only,
+        },
+        tags=["coding-agent", "workflow"],
+    ) as trace:
+        try:
+            with tracer.span("mcp.get_system_prompt", span_type="tool") as span:
+                system_prompt = await tool_client.get_system_prompt()
+                span.set_output({"prompt_length": len(system_prompt)})
 
-    events = tuple(final_state["events"])
-    return AgentResult(
-        content=final_answer,
-        messages=tuple(final_state["messages"]),
-        iterations=final_state["turn_count"],
-        events=events,
-        tool_call_count=sum(1 for event in events if event.get("type") == "tool_executed"),
-        blocked_reason=final_state.get("blocked_reason"),
-    )
+            with tracer.span("mcp.list_tools", span_type="tool") as span:
+                mcp_tools = await tool_client.list_tools()
+                span.set_output({"tools": [tool.get("name") for tool in mcp_tools]})
+
+            tools = [mcp_tool_to_openai_tool(tool) for tool in mcp_tools]
+            graph = _build_graph(
+                settings=settings,
+                model_client=model_client,
+                tool_client=tool_client,
+                tracer=tracer,
+                system_prompt=system_prompt,
+                tools=tools,
+            )
+            final_state = await graph.ainvoke(_initial_state(user_prompt, request_id))
+            final_answer = final_state.get("final_answer") or final_state.get("blocked_reason")
+            if final_answer is None:
+                final_answer = "No final answer was produced."
+
+            events = tuple(final_state["events"])
+            result = AgentResult(
+                content=final_answer,
+                messages=tuple(final_state["messages"]),
+                iterations=final_state["turn_count"],
+                events=events,
+                tool_call_count=sum(
+                    1 for event in events if event.get("type") == "tool_executed"
+                ),
+                blocked_reason=final_state.get("blocked_reason"),
+            )
+            trace.set_output(
+                {
+                    "status": "blocked" if result.blocked_reason else "completed",
+                    "intent": final_state["intent"],
+                    "risk_level": final_state["risk_level"],
+                    "iterations": result.iterations,
+                    "tool_call_count": result.tool_call_count,
+                    "blocked_reason": result.blocked_reason,
+                    "final_answer": summarize_text(result.content),
+                }
+            )
+            return result
+        except Exception as exc:
+            trace.set_error(str(exc), type_=type(exc).__name__)
+            raise
 
 
 def _build_graph(
@@ -114,6 +160,7 @@ def _build_graph(
     settings: Settings,
     model_client: ModelClient,
     tool_client: ToolClient,
+    tracer: Tracer,
     system_prompt: str,
     tools: list[JsonObject],
 ) -> Any:
@@ -126,244 +173,412 @@ def _build_graph(
         ) from exc
 
     async def intake(state: CodingAgentState) -> JsonObject:
-        return {
-            "messages": [
-                {"role": "system", "content": build_base_system_prompt(system_prompt)},
-                {"role": "user", "content": state["user_prompt"]},
-            ],
-            "events": _append_event(
-                state,
-                "user_input",
-                content=state["user_prompt"],
-            ),
-        }
+        with tracer.span(
+            "workflow.intake",
+            input={"request_id": state["request_id"]},
+        ) as span:
+            result = {
+                "messages": [
+                    {"role": "system", "content": build_base_system_prompt(system_prompt)},
+                    {"role": "user", "content": state["user_prompt"]},
+                ],
+                "events": _append_event(
+                    state,
+                    "user_input",
+                    content=state["user_prompt"],
+                ),
+            }
+            span.set_output({"message_count": len(result["messages"])})
+            return result
 
     async def intent_classifier(state: CodingAgentState) -> JsonObject:
-        intent = classify_intent(state["user_prompt"])
-        risk_level = _risk_for_intent(intent)
-        return {
-            "intent": intent,
-            "risk_level": risk_level,
-            "events": _append_event(
-                state,
-                "intent_classified",
-                intent=intent,
-                risk_level=risk_level,
-            ),
-        }
+        with tracer.span(
+            "workflow.intent_classifier",
+            input={"user_prompt": summarize_text(state["user_prompt"])},
+        ) as span:
+            intent = classify_intent(state["user_prompt"])
+            risk_level = _risk_for_intent(intent)
+            result = {
+                "intent": intent,
+                "risk_level": risk_level,
+                "events": _append_event(
+                    state,
+                    "intent_classified",
+                    intent=intent,
+                    risk_level=risk_level,
+                ),
+            }
+            span.set_output({"intent": intent, "risk_level": risk_level})
+            return result
 
     async def planner(state: CodingAgentState) -> JsonObject:
-        plan = _create_plan(state["user_prompt"], state["intent"])
-        return {
-            "plan": plan,
-            "events": _append_event(state, "plan_created", **plan),
-        }
+        with tracer.span(
+            "workflow.planner",
+            input={"intent": state["intent"], "risk_level": state["risk_level"]},
+        ) as span:
+            plan = _create_plan(state["user_prompt"], state["intent"])
+            result = {
+                "plan": plan,
+                "events": _append_event(state, "plan_created", **plan),
+            }
+            span.set_output(_plan_trace_summary(plan))
+            return result
 
     async def model_step(state: CodingAgentState) -> JsonObject:
-        available_tools = _tools_for_state(tools, state)
-        response = _coerce_text_tool_call(
-            await model_client.complete(
-                _messages_for_executor_node(state),
-                available_tools,
-            ),
-            _tool_names_from_openai_tools(available_tools),
-        )
-        assistant_message = _assistant_message(response)
-        pending_tool_calls = [
-            _tool_call_to_dict(tool_call)
-            for tool_call in response.tool_calls
-        ]
-        events = _append_event_to_list(
-            state["events"],
-            "model_responded",
-            turn=state["turn_count"] + 1,
-            content=response.content,
-            tool_calls=pending_tool_calls,
-        )
-        return {
-            "messages": [*state["messages"], assistant_message],
-            "pending_tool_calls": pending_tool_calls,
-            "turn_count": state["turn_count"] + 1,
-            "final_answer": response.content if not response.tool_calls else None,
-            "events": events,
-        }
+        with tracer.span(
+            "workflow.model_step",
+            input={"turn": state["turn_count"] + 1, "intent": state["intent"]},
+        ) as span:
+            available_tools = _tools_for_state(tools, state)
+            messages = _messages_for_executor_node(state)
+            with tracer.span(
+                "model.chat_completion",
+                span_type="llm",
+                input={
+                    "messages": summarize_messages(messages),
+                    "tools": summarize_tools(available_tools),
+                },
+                model=settings.model_name,
+                provider="llama.cpp",
+            ) as model_span:
+                raw_response = await model_client.complete(messages, available_tools)
+                response = _coerce_text_tool_call(
+                    raw_response,
+                    _tool_names_from_openai_tools(available_tools),
+                )
+                model_span.set_output(
+                    {
+                        "content": summarize_text(response.content or ""),
+                        "content_length": len(response.content or ""),
+                        "tool_calls": summarize_tool_calls(response.tool_calls),
+                    }
+                )
+                if response.usage is not None:
+                    model_span.set_usage(response.usage)
+
+            assistant_message = _assistant_message(response)
+            pending_tool_calls = [
+                _tool_call_to_dict(tool_call)
+                for tool_call in response.tool_calls
+            ]
+            events = _append_event_to_list(
+                state["events"],
+                "model_responded",
+                turn=state["turn_count"] + 1,
+                content=response.content,
+                tool_calls=pending_tool_calls,
+            )
+            result = {
+                "messages": [*state["messages"], assistant_message],
+                "pending_tool_calls": pending_tool_calls,
+                "turn_count": state["turn_count"] + 1,
+                "final_answer": response.content if not response.tool_calls else None,
+                "events": events,
+            }
+            span.set_output(
+                {
+                    "turn": result["turn_count"],
+                    "pending_tool_call_count": len(pending_tool_calls),
+                    "final_answer_length": len(result["final_answer"] or ""),
+                }
+            )
+            return result
 
     async def policy_gate(state: CodingAgentState) -> JsonObject:
-        events = state["events"]
-        messages = state["messages"]
-        allowed_tool_calls: list[JsonObject] = []
-        blocked_messages: list[JsonObject] = []
-        blocked_reason = state["blocked_reason"]
+        with tracer.span(
+            "workflow.policy_gate",
+            input={
+                "pending_tool_calls": summarize_tool_calls(state["pending_tool_calls"]),
+                "tool_call_count": _tool_execution_count(state["events"]),
+                "max_tool_calls": _max_tool_calls_from_plan(state),
+            },
+        ) as span:
+            events = state["events"]
+            messages = state["messages"]
+            allowed_tool_calls: list[JsonObject] = []
+            blocked_messages: list[JsonObject] = []
+            blocked_reason = state["blocked_reason"]
+            blocked_count = 0
 
-        for tool_call in state["pending_tool_calls"]:
-            name = str(tool_call.get("name", ""))
-            call_id = str(tool_call.get("id", ""))
-            raw_arguments = str(tool_call.get("arguments", "{}"))
-            arguments, parse_error = _parse_tool_arguments(raw_arguments)
+            for tool_call in state["pending_tool_calls"]:
+                name = str(tool_call.get("name", ""))
+                call_id = str(tool_call.get("id", ""))
+                raw_arguments = str(tool_call.get("arguments", "{}"))
+                arguments, parse_error = _parse_tool_arguments(raw_arguments)
 
-            if parse_error is not None:
-                reason = f"invalid JSON arguments for {name}: {parse_error}"
+                if parse_error is not None:
+                    reason = f"invalid JSON arguments for {name}: {parse_error}"
+                    _record_policy_block(
+                        tracer,
+                        tool=name,
+                        reason=reason,
+                        raw_arguments=raw_arguments,
+                    )
+                    events = _append_event_to_list(
+                        events,
+                        "tool_blocked",
+                        tool=name,
+                        arguments=raw_arguments,
+                        reason=reason,
+                    )
+                    blocked_messages.append(_tool_message(call_id, name, f"Error: {reason}"))
+                    blocked_count += 1
+                    continue
+
+                policy_violation = _tool_policy_violation(name, arguments, state)
+                if policy_violation is not None:
+                    recovery_hint = _policy_recovery_hint(name, arguments, state)
+                    tool_message = f"Policy blocked: {policy_violation}"
+                    if recovery_hint:
+                        tool_message += f" {recovery_hint}"
+                    _record_policy_block(
+                        tracer,
+                        tool=name,
+                        reason=policy_violation,
+                        arguments=arguments,
+                        recovery_hint=recovery_hint,
+                    )
+                    events = _append_event_to_list(
+                        events,
+                        "tool_blocked",
+                        tool=name,
+                        arguments=arguments,
+                        reason=policy_violation,
+                        recovery_hint=recovery_hint,
+                    )
+                    blocked_messages.append(_tool_message(call_id, name, tool_message))
+                    blocked_count += 1
+                    if _blocked_event_count(events) >= 2:
+                        blocked_reason = f"Blocked unsafe tool use: {policy_violation}"
+                    continue
+
+                max_tool_calls = _max_tool_calls_from_plan(state)
+                next_tool_count = _tool_execution_count(events) + len(allowed_tool_calls) + 1
+                if next_tool_count > max_tool_calls:
+                    reason = f"Maximum tool calls ({max_tool_calls}) reached"
+                    _record_policy_block(
+                        tracer,
+                        tool=name,
+                        reason=reason,
+                        arguments=arguments,
+                    )
+                    events = _append_event_to_list(
+                        events,
+                        "tool_blocked",
+                        tool=name,
+                        arguments=arguments,
+                        reason=reason,
+                    )
+                    blocked_messages.append(
+                        _tool_message(call_id, name, f"Policy blocked: {reason}")
+                    )
+                    blocked_reason = reason
+                    blocked_count += 1
+                    continue
+
+                allowed_tool_calls.append({**tool_call, "parsed_arguments": arguments})
                 events = _append_event_to_list(
                     events,
-                    "tool_blocked",
-                    tool=name,
-                    arguments=raw_arguments,
-                    reason=reason,
-                )
-                blocked_messages.append(_tool_message(call_id, name, f"Error: {reason}"))
-                continue
-
-            policy_violation = _tool_policy_violation(name, arguments, state)
-            if policy_violation is not None:
-                recovery_hint = _policy_recovery_hint(name, arguments, state)
-                tool_message = f"Policy blocked: {policy_violation}"
-                if recovery_hint:
-                    tool_message += f" {recovery_hint}"
-                events = _append_event_to_list(
-                    events,
-                    "tool_blocked",
+                    "tool_requested",
                     tool=name,
                     arguments=arguments,
-                    reason=policy_violation,
-                    recovery_hint=recovery_hint,
                 )
-                blocked_messages.append(_tool_message(call_id, name, tool_message))
-                if _blocked_event_count(events) >= 2:
-                    blocked_reason = f"Blocked unsafe tool use: {policy_violation}"
-                continue
 
-            max_tool_calls = _max_tool_calls_from_plan(state)
-            next_tool_count = _tool_execution_count(events) + len(allowed_tool_calls) + 1
-            if next_tool_count > max_tool_calls:
-                reason = f"Maximum tool calls ({max_tool_calls}) reached"
-                events = _append_event_to_list(
-                    events,
-                    "tool_blocked",
-                    tool=name,
-                    arguments=arguments,
-                    reason=reason,
-                )
-                blocked_messages.append(_tool_message(call_id, name, f"Policy blocked: {reason}"))
-                blocked_reason = reason
-                continue
+            if blocked_messages:
+                messages = [*messages, *blocked_messages]
 
-            allowed_tool_calls.append({**tool_call, "parsed_arguments": arguments})
-            events = _append_event_to_list(
-                events,
-                "tool_requested",
-                tool=name,
-                arguments=arguments,
+            result = {
+                "messages": messages,
+                "pending_tool_calls": allowed_tool_calls,
+                "blocked_reason": blocked_reason,
+                "events": events,
+            }
+            span.set_output(
+                {
+                    "allowed_tool_calls": len(allowed_tool_calls),
+                    "blocked_tool_calls": blocked_count,
+                    "blocked_reason": blocked_reason,
+                }
             )
-
-        if blocked_messages:
-            messages = [*messages, *blocked_messages]
-
-        return {
-            "messages": messages,
-            "pending_tool_calls": allowed_tool_calls,
-            "blocked_reason": blocked_reason,
-            "events": events,
-        }
+            return result
 
     async def tool_executor(state: CodingAgentState) -> JsonObject:
-        events = state["events"]
-        messages = state["messages"]
-        for tool_call in state["pending_tool_calls"]:
-            name = str(tool_call["name"])
-            call_id = str(tool_call["id"])
-            arguments = dict(tool_call["parsed_arguments"])
-            result = await tool_client.call_tool(name, arguments)
-            messages = [*messages, _tool_message(call_id, name, result)]
-            events = _append_event_to_list(
-                events,
-                "tool_executed",
-                tool=name,
-                arguments=arguments,
-                result=result,
-            )
-            if _is_successful_write_result(name, result):
+        with tracer.span(
+            "workflow.tool_executor",
+            input={"pending_tool_calls": summarize_tool_calls(state["pending_tool_calls"])},
+        ) as span:
+            events = state["events"]
+            messages = state["messages"]
+            executed_count = 0
+            write_completed_count = 0
+            for tool_call in state["pending_tool_calls"]:
+                name = str(tool_call["name"])
+                call_id = str(tool_call["id"])
+                arguments = dict(tool_call["parsed_arguments"])
+                with tracer.span(
+                    "mcp.call_tool",
+                    span_type="tool",
+                    input={
+                        "tool": name,
+                        "arguments": sanitize_tool_arguments(arguments),
+                    },
+                    metadata={"operation": name},
+                ) as tool_span:
+                    result = await tool_client.call_tool(name, arguments)
+                    is_error = result.startswith("Error:")
+                    tool_span.set_output(
+                        {
+                            "tool": name,
+                            "success": not is_error,
+                            "result": summarize_text(result),
+                        }
+                    )
+                    if is_error:
+                        tool_span.set_error(result, type_="ToolError")
+
+                messages = [*messages, _tool_message(call_id, name, result)]
                 events = _append_event_to_list(
                     events,
-                    "write_completed",
+                    "tool_executed",
                     tool=name,
-                    file_path=arguments.get("file_path"),
+                    arguments=arguments,
                     result=result,
                 )
+                executed_count += 1
+                if _is_successful_write_result(name, result):
+                    events = _append_event_to_list(
+                        events,
+                        "write_completed",
+                        tool=name,
+                        file_path=arguments.get("file_path"),
+                        result=result,
+                    )
+                    with tracer.span(
+                        "workflow.write_completed",
+                        input={"tool": name, "file_path": arguments.get("file_path")},
+                    ) as write_span:
+                        write_span.set_output(
+                            {
+                                "tool": name,
+                                "file_path": arguments.get("file_path"),
+                                "result": summarize_text(result),
+                            }
+                        )
+                    write_completed_count += 1
 
-        return {
-            "messages": messages,
-            "pending_tool_calls": [],
-            "events": events,
-        }
+            result = {
+                "messages": messages,
+                "pending_tool_calls": [],
+                "events": events,
+            }
+            span.set_output(
+                {
+                    "executed_tool_calls": executed_count,
+                    "write_completed_count": write_completed_count,
+                }
+            )
+            return result
 
     async def progress_reviewer(state: CodingAgentState) -> JsonObject:
-        events = state["events"]
-        final_answer = state["final_answer"]
-        blocked_reason = state["blocked_reason"]
-        route: Route = "model_step"
-        reason = "continue"
+        with tracer.span(
+            "workflow.progress_reviewer",
+            input={
+                "turn_count": state["turn_count"],
+                "has_final_answer": state["final_answer"] is not None,
+                "blocked_reason": state["blocked_reason"],
+            },
+        ) as span:
+            events = state["events"]
+            final_answer = state["final_answer"]
+            blocked_reason = state["blocked_reason"]
+            route: Route = "model_step"
+            reason = "continue"
 
-        if blocked_reason is not None:
-            route = "failure_response"
-            reason = "blocked"
-        elif final_answer is not None:
-            if not final_answer.strip():
-                fallback_answer = _fallback_final_answer(state)
-                if fallback_answer is not None:
-                    final_answer = fallback_answer
-                    reason = "fallback_tool_result"
+            if blocked_reason is not None:
+                route = "failure_response"
+                reason = "blocked"
+            elif final_answer is not None:
+                if not final_answer.strip():
+                    fallback_answer = _fallback_final_answer(state)
+                    if fallback_answer is not None:
+                        final_answer = fallback_answer
+                        reason = "fallback_tool_result"
+                    else:
+                        reason = "model_final"
                 else:
                     reason = "model_final"
-            else:
-                reason = "model_final"
-            route = "final_response"
-        elif _should_stop_after_file_read(state):
-            final_answer = _last_successful_tool_result(state, "get_file_content")
-            route = "final_response"
-            reason = "read_only_file_content"
-        elif state["turn_count"] >= settings.max_iterations:
-            blocked_reason = f"Maximum iterations ({settings.max_iterations}) reached"
-            route = "failure_response"
-            reason = "max_iterations"
+                route = "final_response"
+            elif _should_stop_after_file_read(state):
+                final_answer = _last_successful_tool_result(state, "get_file_content")
+                route = "final_response"
+                reason = "read_only_file_content"
+            elif state["turn_count"] >= settings.max_iterations:
+                blocked_reason = f"Maximum iterations ({settings.max_iterations}) reached"
+                route = "failure_response"
+                reason = "max_iterations"
 
-        events = _append_event_to_list(
-            events,
-            "review_completed",
-            route=route,
-            reason=reason,
-        )
-        return {
-            "final_answer": final_answer,
-            "blocked_reason": blocked_reason,
-            "events": events,
-        }
+            events = _append_event_to_list(
+                events,
+                "review_completed",
+                route=route,
+                reason=reason,
+            )
+            result = {
+                "final_answer": final_answer,
+                "blocked_reason": blocked_reason,
+                "events": events,
+            }
+            span.set_output(
+                {
+                    "route": route,
+                    "reason": reason,
+                    "blocked_reason": blocked_reason,
+                    "final_answer": summarize_text(final_answer or ""),
+                }
+            )
+            return result
 
     async def route_next(state: CodingAgentState) -> JsonObject:
         return {}
 
     async def final_response(state: CodingAgentState) -> JsonObject:
-        content = state["final_answer"] or ""
-        return {
-            "events": _append_event(
-                state,
-                "final_answer",
-                content=content,
-                prompt=build_final_response_prompt(
-                    user_prompt=state["user_prompt"],
-                    intent=state["intent"],
-                    blocked_reason=state["blocked_reason"],
-                    tool_events=_events_of_type(state["events"], "tool_executed"),
-                    write_events=_events_of_type(state["events"], "write_completed"),
+        with tracer.span(
+            "workflow.final_response",
+            input={
+                "intent": state["intent"],
+                "tool_events": len(_events_of_type(state["events"], "tool_executed")),
+                "write_events": len(_events_of_type(state["events"], "write_completed")),
+            },
+        ) as span:
+            content = state["final_answer"] or ""
+            prompt = build_final_response_prompt(
+                user_prompt=state["user_prompt"],
+                intent=state["intent"],
+                blocked_reason=state["blocked_reason"],
+                tool_events=_events_of_type(state["events"], "tool_executed"),
+                write_events=_events_of_type(state["events"], "write_completed"),
+            )
+            span.set_output({"final_answer": summarize_text(content)})
+            return {
+                "events": _append_event(
+                    state,
+                    "final_answer",
+                    content=content,
+                    prompt=prompt,
                 ),
-            ),
-        }
+            }
 
     async def failure_response(state: CodingAgentState) -> JsonObject:
-        reason = state["blocked_reason"] or "The agent could not complete the task."
-        return {
-            "final_answer": reason,
-            "events": _append_event(state, "failure", reason=reason),
-        }
+        with tracer.span(
+            "workflow.failure_response",
+            input={"blocked_reason": state["blocked_reason"]},
+        ) as span:
+            reason = state["blocked_reason"] or "The agent could not complete the task."
+            span.set_output({"reason": summarize_text(reason)})
+            return {
+                "final_answer": reason,
+                "events": _append_event(state, "failure", reason=reason),
+            }
 
     def route_from_state(state: CodingAgentState) -> Route:
         if state["blocked_reason"] is not None:
@@ -406,9 +621,9 @@ def _build_graph(
     return graph.compile()
 
 
-def _initial_state(user_prompt: str) -> CodingAgentState:
+def _initial_state(user_prompt: str, request_id: str | None = None) -> CodingAgentState:
     return {
-        "request_id": str(uuid4()),
+        "request_id": request_id or str(uuid4()),
         "user_prompt": user_prompt,
         "intent": "unknown",
         "risk_level": "safe",
@@ -540,6 +755,43 @@ def _tool_names_from_openai_tools(tools: list[JsonObject]) -> set[str]:
         if isinstance(tool.get("function"), dict)
         and isinstance(tool["function"].get("name"), str)
     }
+
+
+def _plan_trace_summary(plan: JsonObject) -> JsonObject:
+    return {
+        "intent": plan.get("intent"),
+        "allowed_tools": list(plan.get("allowed_tools", [])),
+        "forbidden_tools": list(plan.get("forbidden_tools", [])),
+        "preferred_tools": list(plan.get("preferred_tools", [])),
+        "expected_write_paths": list(plan.get("expected_write_paths", [])),
+        "max_tool_calls": plan.get("max_tool_calls"),
+        "completion_signal": plan.get("completion_signal"),
+    }
+
+
+def _record_policy_block(
+    tracer: Tracer,
+    *,
+    tool: str,
+    reason: str,
+    arguments: JsonObject | None = None,
+    raw_arguments: str | None = None,
+    recovery_hint: str = "",
+) -> None:
+    input_payload: JsonObject = {"tool": tool}
+    if arguments is not None:
+        input_payload["arguments"] = sanitize_tool_arguments(arguments)
+    if raw_arguments is not None:
+        input_payload["raw_arguments"] = summarize_text(raw_arguments)
+
+    with tracer.span("policy.blocked_tool", span_type="guardrail", input=input_payload) as span:
+        span.set_output(
+            {
+                "tool": tool,
+                "reason": reason,
+                "recovery_hint": recovery_hint,
+            }
+        )
 
 
 def format_agent_trace(result: AgentResult) -> list[str]:

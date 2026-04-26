@@ -102,6 +102,27 @@ class ParseChatCompletionResponseTests(unittest.TestCase):
         self.assertEqual(parsed.tool_calls[0].name, "get_files_info")
         self.assertEqual(parsed.tool_calls[0].arguments, '{"directory": "."}')
 
+    def test_preserves_openai_compatible_usage(self):
+        parsed = parse_chat_completion_response(
+            {
+                "choices": [{"message": {"content": "done"}}],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 4,
+                    "total_tokens": 14,
+                },
+            }
+        )
+
+        self.assertEqual(
+            parsed.usage,
+            {
+                "prompt_tokens": 10,
+                "completion_tokens": 4,
+                "total_tokens": 14,
+            },
+        )
+
     def test_rejects_response_without_choices(self):
         with self.assertRaisesRegex(RuntimeError, "choices"):
             parse_chat_completion_response({})

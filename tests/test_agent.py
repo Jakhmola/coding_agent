@@ -6,8 +6,9 @@ from unittest.mock import patch
 
 from coding_agent.agent import format_agent_trace, mcp_tool_to_openai_tool, run_agent
 from coding_agent.config import load_settings
-from coding_agent.workflow import AgentResult, classify_intent
 from coding_agent.model_client import ModelResponse, ModelToolCall
+from coding_agent.tracing import RecordingTracer
+from coding_agent.workflow import AgentResult, classify_intent
 from prompts import build_final_response_prompt
 
 try:
@@ -202,6 +203,50 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second_messages[-1]["role"], "tool")
         self.assertEqual(second_messages[-1]["tool_call_id"], "call_1")
         self.assertIn("get_files_info result", second_messages[-1]["content"])
+
+    async def test_tracing_records_workflow_model_and_tool_spans(self):
+        tracer = RecordingTracer()
+        model = FakeModelClient(
+            [
+                ModelResponse(
+                    None,
+                    (
+                        ModelToolCall(
+                            id="call_1",
+                            name="get_files_info",
+                            arguments='{"directory": "."}',
+                        ),
+                    ),
+                    usage={"prompt_tokens": 10, "completion_tokens": 3},
+                ),
+                ModelResponse("files checked"),
+            ]
+        )
+
+        result = await run_agent(
+            "list files",
+            settings=_settings(),
+            model_client=model,
+            tool_client=FakeToolClient(),
+            tracer=tracer,
+        )
+
+        self.assertEqual(result.content, "files checked")
+        record_names = [record.name for record in tracer.records]
+        self.assertIn("coding_agent.workflow", record_names)
+        self.assertIn("workflow.model_step", record_names)
+        self.assertIn("model.chat_completion", record_names)
+        self.assertIn("workflow.policy_gate", record_names)
+        self.assertIn("workflow.tool_executor", record_names)
+        self.assertIn("mcp.call_tool", record_names)
+        workflow_record = _first_record(tracer, "coding_agent.workflow")
+        self.assertEqual(workflow_record.output["status"], "completed")
+        llm_record = _first_record(tracer, "model.chat_completion")
+        self.assertEqual(llm_record.span_type, "llm")
+        self.assertEqual(llm_record.usage["prompt_tokens"], 10)
+        tool_record = _first_record(tracer, "mcp.call_tool")
+        self.assertEqual(tool_record.input["tool"], "get_files_info")
+        self.assertTrue(tool_record.output["success"])
 
     async def test_coerces_plain_json_tool_request_from_model_content(self):
         model = FakeModelClient(
@@ -450,6 +495,39 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(blocked_events[0]["tool"], "write_file")
         self.assertIsNone(result.blocked_reason)
 
+    async def test_tracing_records_policy_block_with_sanitized_arguments(self):
+        tracer = RecordingTracer()
+        model = FakeModelClient(
+            [
+                ModelResponse(
+                    None,
+                    (
+                        ModelToolCall(
+                            id="call_1",
+                            name="write_file",
+                            arguments='{"file_path": "content.txt", "content": "secret text"}',
+                        ),
+                    ),
+                ),
+                ModelResponse("I will answer without writing."),
+            ]
+        )
+
+        result = await run_agent(
+            "print lorem.txt file content",
+            settings=_settings(),
+            model_client=model,
+            tool_client=FakeToolClient(),
+            tracer=tracer,
+        )
+
+        self.assertEqual(result.content, "I will answer without writing.")
+        block = _first_record(tracer, "policy.blocked_tool")
+        self.assertEqual(block.span_type, "guardrail")
+        self.assertEqual(block.input["tool"], "write_file")
+        self.assertIsInstance(block.input["arguments"]["content"], dict)
+        self.assertIn("not allowed", block.output["reason"])
+
     async def test_blocks_run_python_file_for_read_only_prompt(self):
         model = FakeModelClient(
             [
@@ -554,6 +632,37 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
             model.calls[0]["messages"][0]["content"],
         )
         self.assertIn("Preferred tools: append_file", model.calls[0]["messages"][0]["content"])
+
+    async def test_tracing_records_write_completion_span(self):
+        tracer = RecordingTracer()
+        model = FakeModelClient(
+            [
+                ModelResponse(
+                    None,
+                    (
+                        ModelToolCall(
+                            id="call_1",
+                            name="append_file",
+                            arguments='{"file_path": "notes.txt", "content": "hello"}',
+                        ),
+                    ),
+                ),
+                ModelResponse("added it"),
+            ]
+        )
+
+        result = await run_agent(
+            "add hello to notes.txt",
+            settings=_settings(),
+            model_client=model,
+            tool_client=FakeToolClient(),
+            tracer=tracer,
+        )
+
+        self.assertEqual(result.content, "added it")
+        write_record = _first_record(tracer, "workflow.write_completed")
+        self.assertEqual(write_record.output["tool"], "append_file")
+        self.assertEqual(write_record.output["file_path"], "notes.txt")
 
     async def test_add_prompt_blocks_broad_write_then_allows_append(self):
         model = FakeModelClient(
@@ -729,6 +838,7 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("write_file", sent_tool_names)
 
     async def test_explicit_run_prompt_allows_run_python_file(self):
+        tracer = RecordingTracer()
         model = FakeModelClient(
             [
                 ModelResponse(
@@ -751,10 +861,14 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
             settings=_settings(),
             model_client=model,
             tool_client=tools,
+            tracer=tracer,
         )
 
         self.assertEqual(result.content, "ran it")
         self.assertEqual(tools.calls, [("run_python_file", {"file_path": "main.py"})])
+        tool_record = _first_record(tracer, "mcp.call_tool")
+        self.assertEqual(tool_record.input["tool"], "run_python_file")
+        self.assertTrue(tool_record.output["success"])
 
     async def test_empty_final_after_tool_uses_latest_tool_result(self):
         model = FakeModelClient(
@@ -853,6 +967,7 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Blocked unsafe tool use", result.content)
 
     async def test_max_tool_calls_stops_runaway_tool_use(self):
+        tracer = RecordingTracer()
         model = FakeModelClient(
             [
                 ModelResponse(
@@ -875,6 +990,7 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
             settings=_settings(),
             model_client=model,
             tool_client=tools,
+            tracer=tracer,
         )
 
         self.assertEqual(
@@ -889,6 +1005,8 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Maximum tool calls (4) reached", result.content)
         self.assertIn("Maximum tool calls (4) reached", result.blocked_reason)
         self.assertEqual(model.calls[-1]["tools"], [])
+        block = _first_record(tracer, "policy.blocked_tool")
+        self.assertIn("Maximum tool calls", block.output["reason"])
 
     async def test_tool_error_is_recorded_and_routed_back_to_model(self):
         model = FakeModelClient(
@@ -1017,6 +1135,13 @@ def _sent_tool_names(model_call):
         tool["function"]["name"]
         for tool in model_call["tools"]
     }
+
+
+def _first_record(tracer, name):
+    for record in tracer.records:
+        if record.name == name:
+            return record
+    raise AssertionError(f"Missing trace record: {name}")
 
 
 if __name__ == "__main__":

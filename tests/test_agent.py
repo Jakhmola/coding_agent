@@ -1,3 +1,4 @@
+import asyncio
 import os
 import unittest
 from dataclasses import replace
@@ -5,7 +6,15 @@ from unittest.mock import patch
 
 from coding_agent.agent import format_agent_trace, mcp_tool_to_openai_tool, run_agent
 from coding_agent.config import load_settings
+from coding_agent.workflow import AgentResult, classify_intent
 from coding_agent.model_client import ModelResponse, ModelToolCall
+
+try:
+    import langgraph  # noqa: F401
+except ModuleNotFoundError:
+    LANGGRAPH_AVAILABLE = False
+else:
+    LANGGRAPH_AVAILABLE = True
 
 
 class FakeModelClient:
@@ -34,7 +43,34 @@ class FakeToolClient:
                     "type": "object",
                     "properties": {"directory": {"type": "string"}},
                 },
-            }
+            },
+            {
+                "name": "get_file_content",
+                "description": "Read a file",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"file_path": {"type": "string"}},
+                },
+            },
+            {
+                "name": "write_file",
+                "description": "Write a file",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string"},
+                        "content": {"type": "string"},
+                    },
+                },
+            },
+            {
+                "name": "run_python_file",
+                "description": "Run a Python file",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"file_path": {"type": "string"}},
+                },
+            },
         ]
 
     async def list_tools(self):
@@ -48,7 +84,24 @@ class FakeToolClient:
         return f"{name} result"
 
 
+class ErrorToolClient(FakeToolClient):
+    async def call_tool(self, name, arguments):
+        self.calls.append((name, arguments))
+        return "Error: file not found"
+
+
+@unittest.skipIf(not LANGGRAPH_AVAILABLE, "langgraph is not installed")
 class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        asyncio.get_running_loop().slow_callback_duration = 1.0
+
+    def test_classifies_add_prompt_as_write_intent(self):
+        self.assertEqual(
+            classify_intent("add 'this is a new line' to lrem.txt"),
+            "write",
+        )
+        self.assertEqual(classify_intent("uv add langgraph"), "dependency")
+
     async def test_returns_direct_final_answer(self):
         model = FakeModelClient([ModelResponse("done")])
         tools = FakeToolClient()
@@ -241,7 +294,7 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tool_message["role"], "tool")
         self.assertIn("invalid JSON arguments", tool_message["content"])
 
-    async def test_fails_when_max_iterations_is_reached(self):
+    async def test_returns_failure_when_max_iterations_is_reached(self):
         model = FakeModelClient(
             [
                 ModelResponse(
@@ -267,13 +320,277 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
             ]
         )
 
-        with self.assertRaisesRegex(RuntimeError, "Maximum iterations"):
-            await run_agent(
-                "loop",
-                settings=replace(_settings(), max_iterations=2),
-                model_client=model,
-                tool_client=FakeToolClient(),
-            )
+        result = await run_agent(
+            "loop",
+            settings=replace(_settings(), max_iterations=2),
+            model_client=model,
+            tool_client=FakeToolClient(),
+        )
+
+        self.assertIn("Maximum iterations", result.content)
+        self.assertIn("Maximum iterations", result.blocked_reason)
+
+    async def test_print_file_content_stops_after_single_read(self):
+        model = FakeModelClient(
+            [
+                ModelResponse(
+                    None,
+                    (
+                        ModelToolCall(
+                            id="call_1",
+                            name="get_file_content",
+                            arguments='{"file_path": "lorem.txt"}',
+                        ),
+                    ),
+                ),
+                ModelResponse("should not be used"),
+            ]
+        )
+        tools = FakeToolClient()
+
+        result = await run_agent(
+            "print lorem.txt file content",
+            settings=_settings(),
+            model_client=model,
+            tool_client=tools,
+        )
+
+        self.assertEqual(result.content, "get_file_content result")
+        self.assertEqual(result.iterations, 1)
+        self.assertEqual(result.tool_call_count, 1)
+        self.assertEqual(tools.calls, [("get_file_content", {"file_path": "lorem.txt"})])
+        event_types = [event["type"] for event in result.events]
+        self.assertIn("intent_classified", event_types)
+        self.assertIn("tool_executed", event_types)
+        self.assertNotIn("tool_blocked", event_types)
+
+    async def test_blocks_write_file_for_read_only_prompt(self):
+        model = FakeModelClient(
+            [
+                ModelResponse(
+                    None,
+                    (
+                        ModelToolCall(
+                            id="call_1",
+                            name="write_file",
+                            arguments='{"file_path": "content.txt", "content": "new_text"}',
+                        ),
+                    ),
+                ),
+                ModelResponse("I will answer without writing."),
+            ]
+        )
+        tools = FakeToolClient()
+
+        result = await run_agent(
+            "print lorem.txt file content",
+            settings=_settings(),
+            model_client=model,
+            tool_client=tools,
+        )
+
+        self.assertEqual(result.content, "I will answer without writing.")
+        self.assertEqual(tools.calls, [])
+        blocked_events = [
+            event for event in result.events if event["type"] == "tool_blocked"
+        ]
+        self.assertEqual(len(blocked_events), 1)
+        self.assertEqual(blocked_events[0]["tool"], "write_file")
+        self.assertIsNone(result.blocked_reason)
+
+    async def test_blocks_run_python_file_for_read_only_prompt(self):
+        model = FakeModelClient(
+            [
+                ModelResponse(
+                    None,
+                    (
+                        ModelToolCall(
+                            id="call_1",
+                            name="run_python_file",
+                            arguments='{"file_path": "main.py"}',
+                        ),
+                    ),
+                ),
+                ModelResponse("I will answer without running code."),
+            ]
+        )
+        tools = FakeToolClient()
+
+        result = await run_agent(
+            "show main.py content",
+            settings=_settings(),
+            model_client=model,
+            tool_client=tools,
+        )
+
+        self.assertEqual(result.content, "I will answer without running code.")
+        self.assertEqual(tools.calls, [])
+        blocked_events = [
+            event for event in result.events if event["type"] == "tool_blocked"
+        ]
+        self.assertEqual(blocked_events[0]["tool"], "run_python_file")
+
+    async def test_explicit_write_prompt_allows_write_file(self):
+        model = FakeModelClient(
+            [
+                ModelResponse(
+                    None,
+                    (
+                        ModelToolCall(
+                            id="call_1",
+                            name="write_file",
+                            arguments='{"file_path": "content.txt", "content": "new_text"}',
+                        ),
+                    ),
+                ),
+                ModelResponse("wrote it"),
+            ]
+        )
+        tools = FakeToolClient()
+
+        result = await run_agent(
+            "write new_text to content.txt",
+            settings=_settings(),
+            model_client=model,
+            tool_client=tools,
+        )
+
+        self.assertEqual(result.content, "wrote it")
+        self.assertEqual(
+            tools.calls,
+            [("write_file", {"file_path": "content.txt", "content": "new_text"})],
+        )
+
+    async def test_explicit_add_prompt_allows_write_file(self):
+        model = FakeModelClient(
+            [
+                ModelResponse(
+                    None,
+                    (
+                        ModelToolCall(
+                            id="call_1",
+                            name="write_file",
+                            arguments='{"file_path": "lorem.txt", "content": "new_text"}',
+                        ),
+                    ),
+                ),
+                ModelResponse("added it"),
+            ]
+        )
+        tools = FakeToolClient()
+
+        result = await run_agent(
+            "add new_text to lorem.txt",
+            settings=_settings(),
+            model_client=model,
+            tool_client=tools,
+        )
+
+        self.assertEqual(result.content, "added it")
+        self.assertEqual(result.tool_call_count, 1)
+        self.assertEqual(
+            tools.calls,
+            [("write_file", {"file_path": "lorem.txt", "content": "new_text"})],
+        )
+
+    async def test_explicit_run_prompt_allows_run_python_file(self):
+        model = FakeModelClient(
+            [
+                ModelResponse(
+                    None,
+                    (
+                        ModelToolCall(
+                            id="call_1",
+                            name="run_python_file",
+                            arguments='{"file_path": "main.py"}',
+                        ),
+                    ),
+                ),
+                ModelResponse("ran it"),
+            ]
+        )
+        tools = FakeToolClient()
+
+        result = await run_agent(
+            "run main.py",
+            settings=_settings(),
+            model_client=model,
+            tool_client=tools,
+        )
+
+        self.assertEqual(result.content, "ran it")
+        self.assertEqual(tools.calls, [("run_python_file", {"file_path": "main.py"})])
+
+    async def test_repeated_unsafe_tool_proposal_stops_blocked(self):
+        model = FakeModelClient(
+            [
+                ModelResponse(
+                    None,
+                    (
+                        ModelToolCall(
+                            id="call_1",
+                            name="write_file",
+                            arguments='{"file_path": "content.txt", "content": "one"}',
+                        ),
+                    ),
+                ),
+                ModelResponse(
+                    None,
+                    (
+                        ModelToolCall(
+                            id="call_2",
+                            name="write_file",
+                            arguments='{"file_path": "content.txt", "content": "two"}',
+                        ),
+                    ),
+                ),
+            ]
+        )
+        tools = FakeToolClient()
+
+        result = await run_agent(
+            "print lorem.txt file content",
+            settings=_settings(),
+            model_client=model,
+            tool_client=tools,
+        )
+
+        self.assertEqual(tools.calls, [])
+        self.assertIsNotNone(result.blocked_reason)
+        self.assertIn("Blocked unsafe tool use", result.content)
+
+    async def test_tool_error_is_recorded_and_routed_back_to_model(self):
+        model = FakeModelClient(
+            [
+                ModelResponse(
+                    None,
+                    (
+                        ModelToolCall(
+                            id="call_1",
+                            name="get_file_content",
+                            arguments='{"file_path": "missing.txt"}',
+                        ),
+                    ),
+                ),
+                ModelResponse("missing.txt was not found"),
+            ]
+        )
+        tools = ErrorToolClient()
+
+        result = await run_agent(
+            "print missing.txt file content",
+            settings=_settings(),
+            model_client=model,
+            tool_client=tools,
+        )
+
+        self.assertEqual(result.content, "missing.txt was not found")
+        self.assertEqual(tools.calls, [("get_file_content", {"file_path": "missing.txt"})])
+        tool_events = [
+            event for event in result.events if event["type"] == "tool_executed"
+        ]
+        self.assertEqual(tool_events[0]["result"], "Error: file not found")
+        self.assertEqual(result.iterations, 2)
 
     def test_converts_mcp_tool_schema_to_openai_tool_schema(self):
         converted = mcp_tool_to_openai_tool(
@@ -288,31 +605,30 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(converted["function"]["name"], "read")
         self.assertEqual(converted["function"]["parameters"]["type"], "object")
 
-    def test_formats_agent_trace_from_messages(self):
+    def test_formats_agent_trace_from_events(self):
         lines = format_agent_trace(
-            (
-                {"role": "system", "content": "system prompt"},
-                {"role": "user", "content": "list files"},
-                {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [
-                        {
-                            "id": "call_1",
-                            "type": "function",
-                            "function": {
-                                "name": "get_files_info",
-                                "arguments": '{"directory": "."}',
-                            },
-                        }
-                    ],
-                },
-                {
-                    "role": "tool",
-                    "tool_call_id": "call_1",
-                    "name": "get_files_info",
-                    "content": "- README.md: file_size=12 bytes, is_dir=False",
-                },
+            AgentResult(
+                content="done",
+                messages=(),
+                iterations=1,
+                tool_call_count=1,
+                events=(
+                    {
+                        "type": "user_input",
+                        "content": "list files",
+                    },
+                    {
+                        "type": "intent_classified",
+                        "intent": "read_only",
+                        "risk_level": "safe",
+                    },
+                    {
+                        "type": "tool_executed",
+                        "tool": "get_files_info",
+                        "arguments": {"directory": "."},
+                        "result": "- README.md: file_size=12 bytes, is_dir=False",
+                    },
+                ),
             )
         )
 
@@ -321,19 +637,15 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
             [
                 "Agent trace",
                 "User input: list files",
+                "Intent: read_only",
                 "Model turns: 1",
                 "Tool calls: 1",
                 "",
-                "Model turn 1",
-                "  Sent to model:",
-                "    - system prompt",
-                "    - user: list files",
-                "  Model response:",
-                '    - assistant requested tool: get_files_info({"directory": "."})',
-                "  Tool execution:",
-                '    - get_files_info({"directory": "."}) -> - README.md: file_size=12 bytes, is_dir=False',
-                "  Sent back to model next turn:",
-                "    - tool message for get_files_info: - README.md: file_size=12 bytes, is_dir=False",
+                "Event 1: user_input content=list files",
+                "",
+                "Event 2: intent_classified intent=read_only risk=safe",
+                "",
+                'Event 3: tool_executed get_files_info({"directory": "."}) -> - README.md: file_size=12 bytes, is_dir=False',
             ],
         )
 

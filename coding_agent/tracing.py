@@ -501,6 +501,10 @@ def summarize_text(value: str, *, preview_chars: int = MAX_PREVIEW_CHARS) -> Jso
     }
 
 
+def preview_text(value: str, *, preview_chars: int = MAX_PREVIEW_CHARS) -> str:
+    return _truncate(value, limit=preview_chars)
+
+
 def summarize_messages(messages: list[JsonObject]) -> JsonObject:
     total_chars = sum(len(str(message.get("content") or "")) for message in messages)
     roles: list[str] = []

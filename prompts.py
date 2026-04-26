@@ -53,6 +53,9 @@ def build_executor_node_prompt(
         [
             "Executor node instructions:",
             "- Choose at most the tools needed for the next concrete step.",
+            "- For explanatory questions, gather just enough evidence, then answer in concise human prose.",
+            "- Do not include code blocks unless the user explicitly asks for code or commands.",
+            "- Never output tool-call markup as a final answer.",
             "- Use preferred tools before broader tools.",
             "- For append/add/insert requests, use append_file instead of write_file.",
             "- For replace/change/edit requests, use replace_in_file when exact text is known.",

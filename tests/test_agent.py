@@ -143,6 +143,34 @@ class ErrorToolClient(FakeToolClient):
         return "Error: file not found"
 
 
+class ProjectToolClient(FakeToolClient):
+    async def call_tool(self, name, arguments):
+        self.calls.append((name, arguments))
+        if name == "get_files_info" and arguments.get("directory", ".") == ".":
+            return "\n".join(
+                [
+                    "- pkg: file_size=4096 bytes, is_dir=True",
+                    "- README.md: file_size=12 bytes, is_dir=False",
+                    "- main.py: file_size=636 bytes, is_dir=False",
+                ]
+            )
+        if name == "get_file_content" and arguments.get("file_path") == "README.md":
+            return "# calculator\n"
+        if name == "get_file_content" and arguments.get("file_path") == "main.py":
+            return (
+                "import sys\n"
+                "from pkg.calculator import Calculator\n"
+                "from pkg.render import render\n\n"
+                "def main():\n"
+                "    calculator = Calculator()\n"
+                "    print('Calculator App')\n"
+                "    expression = ' '.join(sys.argv[1:])\n"
+                "    result = calculator.evaluate(expression)\n"
+                "    print(render(expression, result))\n"
+            )
+        return await super().call_tool(name, arguments)
+
+
 @unittest.skipIf(not LANGGRAPH_AVAILABLE, "langgraph is not installed")
 class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -154,6 +182,7 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
             "write",
         )
         self.assertEqual(classify_intent("uv add langgraph"), "dependency")
+        self.assertEqual(classify_intent("what is the project even about"), "read_only")
 
     async def test_returns_direct_final_answer(self):
         model = FakeModelClient([ModelResponse("done")])
@@ -234,18 +263,30 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.content, "files checked")
         record_names = [record.name for record in tracer.records]
         self.assertIn("coding_agent.workflow", record_names)
-        self.assertIn("workflow.model_step", record_names)
-        self.assertIn("model.chat_completion", record_names)
-        self.assertIn("workflow.policy_gate", record_names)
-        self.assertIn("workflow.tool_executor", record_names)
-        self.assertIn("mcp.call_tool", record_names)
+        self.assertIn("workflow.setup", record_names)
+        self.assertIn("workflow.classify_request", record_names)
+        self.assertIn("workflow.plan", record_names)
+        self.assertIn("model.executor_turn", record_names)
+        self.assertIn("model.executor_llm", record_names)
+        self.assertIn("policy.review_tool_calls", record_names)
+        self.assertIn("tool.execute_calls", record_names)
+        self.assertIn("tool.get_files_info", record_names)
+        self.assertNotIn("workflow.intake", record_names)
+        self.assertNotIn("mcp.call_tool", record_names)
         workflow_record = _first_record(tracer, "coding_agent.workflow")
+        self.assertEqual(workflow_record.input["user_request"], "list files")
         self.assertEqual(workflow_record.output["status"], "completed")
-        llm_record = _first_record(tracer, "model.chat_completion")
+        self.assertEqual(workflow_record.output["user_answer"], "files checked")
+        setup_record = _first_record(tracer, "workflow.setup")
+        self.assertIn("system_instructions_hash", setup_record.output)
+        self.assertEqual(setup_record.output["tool_count"], 8)
+        llm_record = _first_record(tracer, "model.executor_llm")
         self.assertEqual(llm_record.span_type, "llm")
         self.assertEqual(llm_record.usage["prompt_tokens"], 10)
-        tool_record = _first_record(tracer, "mcp.call_tool")
+        self.assertEqual(llm_record.output["assistant_response_type"], "tool_call")
+        tool_record = _first_record(tracer, "tool.get_files_info")
         self.assertEqual(tool_record.input["tool"], "get_files_info")
+        self.assertEqual(tool_record.metadata["transport"], "mcp")
         self.assertTrue(tool_record.output["success"])
 
     async def test_coerces_plain_json_tool_request_from_model_content(self):
@@ -276,6 +317,207 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
             "get_files_info",
         )
         self.assertEqual(second_messages[-1]["tool_call_id"], "call_text_0")
+
+    async def test_coerces_xml_tool_call_text_from_model_content(self):
+        model = FakeModelClient(
+            [
+                ModelResponse(
+                    "<tool_call><function=get_file_content>"
+                    "<parameter=file_path>README.md</parameter>"
+                    "</function></tool_call>"
+                ),
+                ModelResponse("read it"),
+            ]
+        )
+        tools = FakeToolClient()
+
+        result = await run_agent(
+            "read README.md",
+            settings=_settings(),
+            model_client=model,
+            tool_client=tools,
+        )
+
+        self.assertEqual(result.content, "read it")
+        self.assertEqual(tools.calls, [("get_file_content", {"file_path": "README.md"})])
+        self.assertIsNone(model.calls[1]["messages"][-2]["content"])
+        self.assertEqual(
+            model.calls[1]["messages"][-2]["tool_calls"][0]["function"]["name"],
+            "get_file_content",
+        )
+
+    async def test_project_overview_falls_back_to_human_summary_on_tool_call_leak(self):
+        model = FakeModelClient(
+            [
+                ModelResponse(
+                    None,
+                    (
+                        ModelToolCall(
+                            id="call_1",
+                            name="get_files_info",
+                            arguments='{"directory": "."}',
+                        ),
+                    ),
+                ),
+                ModelResponse(
+                    None,
+                    (
+                        ModelToolCall(
+                            id="call_2",
+                            name="get_file_content",
+                            arguments='{"file_path": "README.md"}',
+                        ),
+                        ModelToolCall(
+                            id="call_3",
+                            name="get_file_content",
+                            arguments='{"file_path": "main.py"}',
+                        ),
+                    ),
+                ),
+                ModelResponse('```json\n{"name": "missing_tool", "arguments": {}}\n```'),
+            ]
+        )
+        tools = ProjectToolClient()
+
+        result = await run_agent(
+            "what is the project even about",
+            settings=_settings(),
+            model_client=model,
+            tool_client=tools,
+        )
+
+        self.assertIn("command-line calculator app", result.content)
+        self.assertIn("pkg.calculator.Calculator", result.content)
+        self.assertNotIn("import sys", result.content)
+        self.assertIsNone(result.blocked_reason)
+        review_events = [
+            event for event in result.events if event["type"] == "review_completed"
+        ]
+        self.assertEqual(
+            review_events[-1]["reason"],
+            "evidence_fallback_after_tool_call_leak",
+        )
+
+    async def test_project_overview_uses_evidence_when_tool_budget_is_hit(self):
+        model = FakeModelClient(
+            [
+                ModelResponse(
+                    None,
+                    (
+                        ModelToolCall(
+                            id="call_1",
+                            name="get_files_info",
+                            arguments='{"directory": "."}',
+                        ),
+                    ),
+                ),
+                ModelResponse(
+                    None,
+                    (
+                        ModelToolCall(
+                            id="call_2",
+                            name="get_file_content",
+                            arguments='{"file_path": "README.md"}',
+                        ),
+                        ModelToolCall(
+                            id="call_3",
+                            name="get_file_content",
+                            arguments='{"file_path": "main.py"}',
+                        ),
+                        ModelToolCall(
+                            id="call_4",
+                            name="get_file_content",
+                            arguments='{"file_path": "tests.py"}',
+                        ),
+                        ModelToolCall(
+                            id="call_5",
+                            name="get_file_content",
+                            arguments='{"file_path": "pkg/calculator.py"}',
+                        ),
+                        ModelToolCall(
+                            id="call_6",
+                            name="get_file_content",
+                            arguments='{"file_path": "pkg/render.py"}',
+                        ),
+                        ModelToolCall(
+                            id="call_7",
+                            name="get_file_content",
+                            arguments='{"file_path": "extra.py"}',
+                        ),
+                    ),
+                ),
+            ]
+        )
+        tools = ProjectToolClient()
+
+        result = await run_agent(
+            "what is the project even about",
+            settings=_settings(),
+            model_client=model,
+            tool_client=tools,
+        )
+
+        self.assertIn("command-line calculator app", result.content)
+        self.assertIsNone(result.blocked_reason)
+        blocked_events = [
+            event for event in result.events if event["type"] == "tool_blocked"
+        ]
+        self.assertEqual(blocked_events[-1]["reason"], "Maximum tool calls (6) reached")
+        review_events = [
+            event for event in result.events if event["type"] == "review_completed"
+        ]
+        self.assertEqual(
+            review_events[-1]["reason"],
+            "evidence_fallback_after_tool_limit",
+        )
+
+    async def test_project_overview_prefers_stable_evidence_summary(self):
+        model = FakeModelClient(
+            [
+                ModelResponse(
+                    None,
+                    (
+                        ModelToolCall(
+                            id="call_1",
+                            name="get_files_info",
+                            arguments='{"directory": "."}',
+                        ),
+                    ),
+                ),
+                ModelResponse(
+                    None,
+                    (
+                        ModelToolCall(
+                            id="call_2",
+                            name="get_file_content",
+                            arguments='{"file_path": "README.md"}',
+                        ),
+                        ModelToolCall(
+                            id="call_3",
+                            name="get_file_content",
+                            arguments='{"file_path": "main.py"}',
+                        ),
+                    ),
+                ),
+                ModelResponse(
+                    "This is a calculator.\n```bash\npython main.py \"3 + 5\"\n```"
+                ),
+            ]
+        )
+
+        result = await run_agent(
+            "what is the project even about",
+            settings=_settings(),
+            model_client=model,
+            tool_client=ProjectToolClient(),
+        )
+
+        self.assertIn("small Python command-line calculator app", result.content)
+        self.assertNotIn("```", result.content)
+        review_events = [
+            event for event in result.events if event["type"] == "review_completed"
+        ]
+        self.assertEqual(review_events[-1]["reason"], "evidence_summary")
 
     async def test_coerces_tool_request_with_unquoted_name_value(self):
         model = FakeModelClient(
@@ -866,8 +1108,9 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.content, "ran it")
         self.assertEqual(tools.calls, [("run_python_file", {"file_path": "main.py"})])
-        tool_record = _first_record(tracer, "mcp.call_tool")
+        tool_record = _first_record(tracer, "tool.run_python_file")
         self.assertEqual(tool_record.input["tool"], "run_python_file")
+        self.assertEqual(tool_record.metadata["transport"], "mcp")
         self.assertTrue(tool_record.output["success"])
 
     async def test_empty_final_after_tool_uses_latest_tool_result(self):
@@ -980,7 +1223,7 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
                         ),
                     ),
                 )
-                for index in range(1, 6)
+                for index in range(1, 8)
             ]
         )
         tools = FakeToolClient()
@@ -1000,10 +1243,12 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
                 ("search_files", {"pattern": "agent"}),
                 ("search_files", {"pattern": "agent"}),
                 ("search_files", {"pattern": "agent"}),
+                ("search_files", {"pattern": "agent"}),
+                ("search_files", {"pattern": "agent"}),
             ],
         )
-        self.assertIn("Maximum tool calls (4) reached", result.content)
-        self.assertIn("Maximum tool calls (4) reached", result.blocked_reason)
+        self.assertIn("Maximum tool calls (6) reached", result.content)
+        self.assertIn("Maximum tool calls (6) reached", result.blocked_reason)
         self.assertEqual(model.calls[-1]["tools"], [])
         block = _first_record(tracer, "policy.blocked_tool")
         self.assertIn("Maximum tool calls", block.output["reason"])
